@@ -186,6 +186,10 @@ mcp = FastMCP("Google Spreadsheet",
               host=_resolved_host,
               port=_resolved_port)
 
+# Optional mobile decision page (enabled only when DECIDE_TOKEN is set)
+from .decide import register as _register_decide
+_register_decide(mcp)
+
 
 def tool(annotations: Optional[ToolAnnotations] = None):
     """
