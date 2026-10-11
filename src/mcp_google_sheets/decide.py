@@ -165,7 +165,8 @@ def get_batch(n: int = BATCH_SIZE) -> Dict[str, Any]:
     for tab in TABS:
         items.extend(parse_tab(tab, _read_tab(tab)))
     return {"items": items[:n], "pending_total": len(items),
-            "write_enabled": _write_enabled()}
+            "write_enabled": _write_enabled(),
+            "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit"}
 
 
 def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -306,6 +307,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 -apple-system,
 padding:16px max(16px,env(safe-area-inset-right)) 96px max(16px,env(safe-area-inset-left))}
 h1{font-size:20px;margin:4px 0 2px}
 .sub{color:var(--mute);font-size:14px;margin-bottom:14px}
+.sub a{color:inherit;font-weight:600;text-decoration:underline}
 .banner{background:var(--warnbg);color:var(--warn);border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:14px}
 .err{background:var(--nobg);color:var(--no)}
 button{font:inherit;border:0;border-radius:12px;min-height:48px;padding:0 14px;cursor:pointer;
@@ -433,13 +435,25 @@ function renderAll(){
 }
 async function load(){
   $('sub').textContent = 'Loading…';
+  function setSub(total, shown, url) {
+    const sub = $('sub');
+    sub.replaceChildren();
+    sub.append(total + ' undecided in ');
+    if (url && /^https:\/\/docs\.google\.com\//.test(url)) {
+      const a = document.createElement('a');
+      a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      a.textContent = 'the sheet';
+      sub.append(a);
+    } else { sub.append('the sheet'); }
+    sub.append(' · showing ' + shown);
+  }
   try {
     const r = await fetch(base + '/api/batch');
     const d = await r.json();
     if (!r.ok) { banner(d.error, true); $('sub').textContent = ''; return; }
-    state = {items: d.items, write: d.write_enabled};
+    state = {items: d.items, write: d.write_enabled, sheetUrl: d.sheet_url};
     banner(d.write_enabled ? '' : 'Read-only preview — buttons are off.', false);
-    $('sub').textContent = d.pending_total + ' undecided in the sheet · showing ' + d.items.length;
+    setSub(d.pending_total, d.items.length, d.sheet_url);
     $('list').replaceChildren(...d.items.map(card));
     renderAll();
     if (!d.items.length) afterChange();
