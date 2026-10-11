@@ -190,6 +190,10 @@ mcp = FastMCP("Google Spreadsheet",
 from .decide import register as _register_decide
 _register_decide(mcp)
 
+# Optional phone push through ntfy (enabled only when NTFY_TOPIC is set)
+from .notify import register as _register_notify
+_register_notify(mcp)
+
 
 def tool(annotations: Optional[ToolAnnotations] = None):
     """
