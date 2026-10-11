@@ -269,11 +269,17 @@ def _focus_cleanup(items: List[Dict[str, Any]]) -> (List[Dict[str, Any]], str):
     return keep, label
 
 
-def get_batch(n: int = BATCH_SIZE) -> Dict[str, Any]:
+def get_batch(n: int = BATCH_SIZE, view: str = "queue") -> Dict[str, Any]:
+    """view="queue": the overall queue. Every agent's task cards, plus ONE
+    summary card ("group") for the Folder CleanUp agent, which opens into its
+    own flow. view="cleanup": that flow, one category/subfolder per batch."""
     items: List[Dict[str, Any]] = []
+    raw: Dict[str, List[List[str]]] = {}
     for tab in TABS:
         try:
-            items.extend(parse_tab(tab, _read_tab(tab)))
+            values = _read_tab(tab)
+            raw[tab] = values
+            items.extend(parse_tab(tab, values))
         except Exception:
             if tab != QUEUE_TAB:
                 raise
@@ -281,12 +287,24 @@ def get_batch(n: int = BATCH_SIZE) -> Dict[str, Any]:
     counts: Dict[str, int] = {}
     for it in items:
         counts[it["agent"]] = counts.get(it["agent"], 0) + 1
-    batch_items, focus = _focus_cleanup(items)
-    return {"items": _mix(batch_items, n, _agent_cap()), "pending_total": len(items),
-            "focus": focus,
-            "agent_counts": counts, "write_enabled": _write_enabled(),
-            "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit",
-            "queue_url": f"https://docs.google.com/spreadsheets/d/{_queue_sheet_id()}/edit"}
+    out: Dict[str, Any] = {
+        "view": view, "pending_total": len(items), "agent_counts": counts,
+        "write_enabled": _write_enabled(), "focus": "",
+        "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit",
+        "queue_url": f"https://docs.google.com/spreadsheets/d/{_queue_sheet_id()}/edit"}
+    cleanup = [i for i in items if i["kind"] != "task"]
+    tasks = [i for i in items if i["kind"] == "task"]
+    if view == "cleanup":
+        batch_items, out["focus"] = _focus_cleanup(cleanup)
+        out["items"] = _mix(batch_items, n, _agent_cap())
+        return out
+    out["items"] = _mix(tasks, n, _agent_cap())
+    ready = len(approved_actions(raw)) if all(t in raw for t in APPROVED_TABS) else 0
+    out["groups"] = [{
+        "agent": CLEANUP_AGENT, "pending": len(cleanup), "approved": ready,
+        "your_call": sum(1 for i in cleanup if i["manual_reason"]),
+    }] if (cleanup or ready) else []
+    return out
 
 
 def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -338,11 +356,12 @@ def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 APPROVED_TABS = ("Organize Proposal", "Delete Candidates")
 
 
-def approved_actions() -> List[Dict[str, str]]:
+def approved_actions(preloaded: Optional[Dict[str, List[List[str]]]] = None
+                     ) -> List[Dict[str, str]]:
     """Rows recorded as Approve=Y and Handler=Coach, as move/delete actions."""
     out: List[Dict[str, str]] = []
     for tab in APPROVED_TABS:
-        values = _read_tab(tab)
+        values = preloaded[tab] if preloaded and tab in preloaded else _read_tab(tab)
         header_row, kind = TABS[tab]
         if len(values) < header_row:
             continue
@@ -445,12 +464,12 @@ def script_info() -> Dict[str, Any]:
 
 
 def log_script(info: Dict[str, Any]) -> Dict[str, Any]:
-    """Append the generated script to the 'Script Log' tab of the pipeline
-    sheet (creating the tab if needed) so it can be copied cleanly from the
+    """Append the generated script to the 'Script Log' tab of the cleanup
+    approval sheet, Downloads_Cleanup_Proposal (creating the tab if needed) so it can be copied cleanly from the
     sheet. An identical script as the latest entry is not logged twice."""
     import datetime as _dt
     svc = _sheets_service().spreadsheets()
-    sid = _queue_sheet_id()
+    sid = _sheet_id()
     with _write_lock:
         meta = svc.get(spreadsheetId=sid, fields="sheets.properties.title").execute()
         titles = {x["properties"]["title"] for x in meta.get("sheets", [])}
@@ -508,8 +527,9 @@ async def _batch(request: Request):
     except ValueError:
         n = BATCH_SIZE
     n = max(1, min(n, 50))
+    view = "cleanup" if request.query_params.get("view") == "cleanup" else "queue"
     try:
-        data = await asyncio.to_thread(get_batch, n)
+        data = await asyncio.to_thread(get_batch, n, view)
     except Exception as e:  # surface a readable cause on the page
         logger.exception("decide: batch failed")
         return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
@@ -727,19 +747,93 @@ function card(it){
   c.appendChild(row);
   return c;
 }
-function afterChange(){
-  const n = state.items.length;
-  renderAll();
-  if (n === 0) showDone(0);
+let mode = 'queue';
+const SNOOZE_MS = 12 * 3600 * 1000;
+function snoozed(){
+  try {
+    const m = JSON.parse(localStorage.getItem('snooze') || '{}'), now = Date.now(), out = {};
+    for (const k in m) if (m[k] > now) out[k] = m[k];
+    return out;
+  } catch (e) { return {}; }
 }
-function showDone(saved){
-  $('all').replaceChildren(); $('list').replaceChildren();
+function setSnooze(agent, on){
+  try {
+    const m = snoozed();
+    if (on) m[agent] = Date.now() + SNOOZE_MS; else delete m[agent];
+    localStorage.setItem('snooze', JSON.stringify(m));
+  } catch (e) {}
+}
+function clearSnoozes(){ try { localStorage.removeItem('snooze'); } catch (e) {} }
+
+function afterChange(){ renderList(); }
+
+function groupCard(g){
   const c = el('div', 'card');
+  c.appendChild(el('div', 'agent', g.agent));
+  c.appendChild(el('div', 'name', g.pending
+    ? g.pending + ' files need a decision'
+    : 'All decided — ready for the move script'));
+  const bits = [];
+  if (g.approved) bits.push(g.approved + ' approved so far');
+  if (g.your_call) bits.push(g.your_call + ' need your call');
+  if (bits.length) c.appendChild(el('div', 'meta', bits.join(' · ')));
+  c.appendChild(el('div', 'meta', 'Opens a short run: a few files at a time, then the script.'));
+  const row = el('div', 'row');
+  const open = el('button', 'yes', 'Open');
+  open.onclick = () => { mode = 'cleanup'; load(); };
+  const later = el('button', '', 'Not now');
+  later.onclick = () => { setSnooze(g.agent, true); renderList(); };
+  row.appendChild(open); row.appendChild(later); c.appendChild(row);
+  return c;
+}
+
+function backBar(){
+  const row = el('div', 'row');
+  const b = el('button', 'full', '← Back to queue');
+  b.onclick = () => { mode = 'queue'; load(); };
+  row.appendChild(b); return row;
+}
+
+function renderList(){
+  const list = $('list');
+  list.replaceChildren();
+  if (mode === 'cleanup') {
+    list.appendChild(backBar());
+    if (!state.items.length) { showDone(0); return; }
+    if (state.focus) list.appendChild(el('div', 'banner', 'Folder CleanUp · ' + state.focus));
+    state.items.forEach(it => list.appendChild(card(it)));
+    renderAll();
+    return;
+  }
+  const snz = snoozed();
+  const groups = (state.groups || []).filter(g => !snz[g.agent]);
+  const hidden = (state.groups || []).length - groups.length;
+  state.items.forEach(it => list.appendChild(card(it)));
+  groups.forEach(g => list.appendChild(groupCard(g)));
+  if (!state.items.length && !groups.length) {
+    const c = el('div', 'card');
+    c.appendChild(el('div', 'name', hidden ? 'Nothing else right now' : 'All clear'));
+    c.appendChild(el('div', 'meta', hidden ? 'You put ' + hidden + ' item(s) on hold with “Not now”.' : 'No agent is waiting on you.'));
+    list.appendChild(c);
+  }
+  if (hidden) {
+    const row = el('div', 'row');
+    const b = el('button', 'full', 'Show on-hold items (' + hidden + ')');
+    b.onclick = () => { clearSnoozes(); renderList(); };
+    row.appendChild(b); list.appendChild(row);
+  }
+  renderAll();
+}
+
+function showDone(saved){
+  $('all').replaceChildren();
+  const c = el('div', 'card');
+  c.appendChild(el('div', 'agent', 'Folder CleanUp'));
   c.appendChild(el('div', 'name', saved ? 'Batch saved — ' + saved + ' decided' : 'Batch done'));
   c.appendChild(el('div', 'meta', 'Repeat with another batch of proposals, or finish and get the move script for everything you approved.'));
   const row = el('div', 'row');
   const more = el('button', 'yes', 'Another batch'); more.onclick = load;
-  const fin = el('button', '', 'Finish → script'); 
+  const fin = el('button', '', 'Finish → script');
   fin.onclick = async () => {
     fin.disabled = true; more.disabled = true;
     try { await fetch(base + '/api/script/log', {method: 'POST'}); } catch (e) {}
@@ -748,6 +842,7 @@ function showDone(saved){
   row.appendChild(more); row.appendChild(fin); c.appendChild(row);
   $('list').appendChild(c);
 }
+
 function renderAll(){
   $('all').replaceChildren();
   const ok = state.items.filter(i => i.proposal);
@@ -760,45 +855,45 @@ function renderAll(){
       const res = await post(ok.map(i => payload(i, i.proposal.approve, i.proposal.handler)));
       const good = res.filter(r => r.status === 'ok' || r.status === 'already_decided').length;
       toast(good + ' saved' + (good < res.length ? ', ' + (res.length - good) + ' changed' : ''));
-      showDone(good);
+      if (mode === 'cleanup') { state.items = []; $('list').replaceChildren(backBar()); showDone(good); }
+      else load();
     } catch (e) { b.disabled = false; toast(e.message); }
   });
   $('all').appendChild(b);
 }
+
+function link(text, url) {
+  const a = document.createElement('a');
+  a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+  a.textContent = text;
+  return a;
+}
+const okUrl = u => u && /^https:\/\/docs\.google\.com\//.test(u);
+function setSub(d) {
+  const sub = $('sub');
+  sub.replaceChildren();
+  sub.append(d.pending_total + ' undecided in ');
+  if (okUrl(d.sheet_url)) sub.append(link('the sheet', d.sheet_url)); else sub.append('the sheet');
+  const counts = Object.entries(d.agent_counts || {});
+  if (counts.length) {
+    const line = el('div', 'meta', counts.map(([k, v]) => k + ' ' + v).join(' · '));
+    if (okUrl(d.queue_url) && counts.some(([k]) => k !== 'Folder CleanUp')) {
+      line.append(' · '); line.append(link('task queue', d.queue_url));
+    }
+    sub.append(line);
+  }
+}
 async function load(){
   $('sub').textContent = 'Loading…';
-  function link(text, url) {
-    const a = document.createElement('a');
-    a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-    a.textContent = text;
-    return a;
-  }
-  const okUrl = u => u && /^https:\/\/docs\.google\.com\//.test(u);
-  function setSub(d) {
-    const sub = $('sub');
-    sub.replaceChildren();
-    sub.append(d.pending_total + ' undecided in ');
-    if (okUrl(d.sheet_url)) sub.append(link('the sheet', d.sheet_url)); else sub.append('the sheet');
-    sub.append(' · showing ' + d.items.length);
-    const counts = Object.entries(d.agent_counts || {});
-    if (counts.length > 1 || (counts.length === 1 && counts[0][0] !== 'Folder CleanUp')) {
-      const line = el('div', 'meta', counts.map(([k, v]) => k + ' ' + v).join(' · '));
-      if (okUrl(d.queue_url) && counts.some(([k]) => k !== 'Folder CleanUp')) {
-        line.append(' · '); line.append(link('task queue', d.queue_url));
-      }
-      sub.append(line);
-    }
-  }
   try {
-    const r = await fetch(base + '/api/batch');
+    const r = await fetch(base + '/api/batch?view=' + mode);
     const d = await r.json();
     if (!r.ok) { banner(d.error, true); $('sub').textContent = ''; return; }
-    state = {items: d.items, write: d.write_enabled, sheetUrl: d.sheet_url};
+    state = {items: d.items, groups: d.groups || [], focus: d.focus || '',
+             write: d.write_enabled, sheetUrl: d.sheet_url};
     banner(d.write_enabled ? '' : 'Read-only preview — buttons are off.', false);
     setSub(d);
-    $('list').replaceChildren(...d.items.map(card));
-    renderAll();
-    if (!d.items.length) showDone(0);
+    renderList();
   } catch (e) { banner('Could not load. Check your connection.', true); }
 }
 load();
