@@ -269,11 +269,17 @@ def _focus_cleanup(items: List[Dict[str, Any]]) -> (List[Dict[str, Any]], str):
     return keep, label
 
 
-def get_batch(n: int = BATCH_SIZE) -> Dict[str, Any]:
+def get_batch(n: int = BATCH_SIZE, view: str = "queue") -> Dict[str, Any]:
+    """view="queue": the overall queue. Every agent's task cards, plus ONE
+    summary card ("group") for the Folder CleanUp agent, which opens into its
+    own flow. view="cleanup": that flow, one category/subfolder per batch."""
     items: List[Dict[str, Any]] = []
+    raw: Dict[str, List[List[str]]] = {}
     for tab in TABS:
         try:
-            items.extend(parse_tab(tab, _read_tab(tab)))
+            values = _read_tab(tab)
+            raw[tab] = values
+            items.extend(parse_tab(tab, values))
         except Exception:
             if tab != QUEUE_TAB:
                 raise
@@ -281,12 +287,24 @@ def get_batch(n: int = BATCH_SIZE) -> Dict[str, Any]:
     counts: Dict[str, int] = {}
     for it in items:
         counts[it["agent"]] = counts.get(it["agent"], 0) + 1
-    batch_items, focus = _focus_cleanup(items)
-    return {"items": _mix(batch_items, n, _agent_cap()), "pending_total": len(items),
-            "focus": focus,
-            "agent_counts": counts, "write_enabled": _write_enabled(),
-            "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit",
-            "queue_url": f"https://docs.google.com/spreadsheets/d/{_queue_sheet_id()}/edit"}
+    out: Dict[str, Any] = {
+        "view": view, "pending_total": len(items), "agent_counts": counts,
+        "write_enabled": _write_enabled(), "focus": "",
+        "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit",
+        "queue_url": f"https://docs.google.com/spreadsheets/d/{_queue_sheet_id()}/edit"}
+    cleanup = [i for i in items if i["kind"] != "task"]
+    tasks = [i for i in items if i["kind"] == "task"]
+    if view == "cleanup":
+        batch_items, out["focus"] = _focus_cleanup(cleanup)
+        out["items"] = _mix(batch_items, n, _agent_cap())
+        return out
+    out["items"] = _mix(tasks, n, _agent_cap())
+    ready = len(approved_actions(raw)) if all(t in raw for t in APPROVED_TABS) else 0
+    out["groups"] = [{
+        "agent": CLEANUP_AGENT, "pending": len(cleanup), "approved": ready,
+        "your_call": sum(1 for i in cleanup if i["manual_reason"]),
+    }] if (cleanup or ready) else []
+    return out
 
 
 def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -338,11 +356,12 @@ def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 APPROVED_TABS = ("Organize Proposal", "Delete Candidates")
 
 
-def approved_actions() -> List[Dict[str, str]]:
+def approved_actions(preloaded: Optional[Dict[str, List[List[str]]]] = None
+                     ) -> List[Dict[str, str]]:
     """Rows recorded as Approve=Y and Handler=Coach, as move/delete actions."""
     out: List[Dict[str, str]] = []
     for tab in APPROVED_TABS:
-        values = _read_tab(tab)
+        values = preloaded[tab] if preloaded and tab in preloaded else _read_tab(tab)
         header_row, kind = TABS[tab]
         if len(values) < header_row:
             continue
@@ -366,21 +385,29 @@ def _ps(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def build_script(actions: List[Dict[str, str]]) -> str:
-    """PowerShell that applies approved actions safely: dry run unless
-    -Apply, never overwrites, deletes only go to a _to_delete folder, and
-    every real move is logged with a ready-made undo script."""
-    lines = []
+def safe_actions(actions: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Drop anything that could leave the Downloads tree."""
+    out = []
     for a in actions:
         parts = [a["src"], a["dest"]]
         if any(p.startswith(("/", "\\")) or ".." in p.replace("\\", "/").split("/")
                or ":" in p for p in parts if p):
-            continue  # refuse anything that could leave the Downloads tree
+            continue
         if not a["src"].startswith("Downloads/"):
             continue
         if a["kind"] == "move" and not a["dest"].startswith("Downloads/"):
             continue
-        lines.append(f"    @{{ Kind={_ps(a['kind'])}; Src={_ps(a['src'])}; Dest={_ps(a['dest'])} }}")
+        out.append(a)
+    return out
+
+
+def build_script(actions: List[Dict[str, str]]) -> str:
+    """PowerShell that applies approved actions safely: dry run unless
+    -Apply, never overwrites, deletes only go to a _to_delete folder, and
+    every real move is logged with a ready-made undo script."""
+    lines = [
+        f"    @{{ Kind={_ps(a['kind'])}; Src={_ps(a['src'])}; Dest={_ps(a['dest'])} }}"
+        for a in safe_actions(actions)]
     body = ",\n".join(lines)
     return f"""# Approved cleanup moves (generated from your Y + Coach rows).
 # Dry run by default: shows what WOULD happen and changes nothing.
@@ -392,8 +419,8 @@ $actions = @(
 {body}
 )
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$logDir = Join-Path $Root 'Downloads\_cleanup_logs'
-$trash  = Join-Path $Root 'Downloads\_to_delete'
+$logDir = Join-Path $Root 'Downloads\\_cleanup_logs'
+$trash  = Join-Path $Root 'Downloads\\_to_delete'
 $log = @(); $undo = @(); $moved = 0; $skipped = 0
 foreach ($a in $actions) {{
     $src = Join-Path $Root ($a.Src -replace '/', '\\')
@@ -422,6 +449,50 @@ if ($Apply -and $moved -gt 0) {{
     Write-Host "Preview only. $($actions.Count) approved, $skipped would be skipped. Re-run with -Apply to do it."
 }}
 """
+
+
+SCRIPT_LOG_TAB = "Script Log"
+SCRIPT_LOG_HEADER = ["Logged UTC", "Moves", "Deletes (to _to_delete)", "Script"]
+MAX_CELL = 45000
+
+
+def script_info() -> Dict[str, Any]:
+    acts = safe_actions(approved_actions())
+    return {"script": build_script(acts),
+            "moves": sum(1 for a in acts if a["kind"] == "move"),
+            "deletes": sum(1 for a in acts if a["kind"] == "delete")}
+
+
+def log_script(info: Dict[str, Any]) -> Dict[str, Any]:
+    """Append the generated script to the 'Script Log' tab of the cleanup
+    approval sheet, Downloads_Cleanup_Proposal (creating the tab if needed) so it can be copied cleanly from the
+    sheet. An identical script as the latest entry is not logged twice."""
+    import datetime as _dt
+    svc = _sheets_service().spreadsheets()
+    sid = _sheet_id()
+    with _write_lock:
+        meta = svc.get(spreadsheetId=sid, fields="sheets.properties.title").execute()
+        titles = {x["properties"]["title"] for x in meta.get("sheets", [])}
+        if SCRIPT_LOG_TAB not in titles:
+            svc.batchUpdate(spreadsheetId=sid, body={"requests": [
+                {"addSheet": {"properties": {"title": SCRIPT_LOG_TAB}}}]}).execute()
+            svc.values().update(
+                spreadsheetId=sid, range=f"'{SCRIPT_LOG_TAB}'!A1:D1",
+                valueInputOption="RAW", body={"values": [SCRIPT_LOG_HEADER]}).execute()
+        text = info["script"]
+        if len(text) > MAX_CELL:
+            text = ("# Script too long for one cell. Open the decision page's "
+                    "/script page to copy it.")
+        rows = svc.values().get(
+            spreadsheetId=sid, range=f"'{SCRIPT_LOG_TAB}'!D:D").execute().get("values", [])
+        if len(rows) > 1 and rows[-1] and rows[-1][0] == text:
+            return {"logged": False, "reason": "same as latest entry"}
+        now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        svc.values().append(
+            spreadsheetId=sid, range=f"'{SCRIPT_LOG_TAB}'!A:D",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": [[now, info["moves"], info["deletes"], text]]}).execute()
+    return {"logged": True}
 
 
 # --------------------------------------------------------------------- web
@@ -456,8 +527,9 @@ async def _batch(request: Request):
     except ValueError:
         n = BATCH_SIZE
     n = max(1, min(n, 50))
+    view = "cleanup" if request.query_params.get("view") == "cleanup" else "queue"
     try:
-        data = await asyncio.to_thread(get_batch, n)
+        data = await asyncio.to_thread(get_batch, n, view)
     except Exception as e:  # surface a readable cause on the page
         logger.exception("decide: batch failed")
         return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
@@ -474,6 +546,36 @@ async def _script(request: Request):
         return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
     headers = {**_NO_CACHE, "Content-Disposition": 'attachment; filename="moves.ps1"'}
     return PlainTextResponse(build_script(actions), headers=headers)
+
+
+async def _script_page(request: Request):
+    if not _authorized(request):
+        return _deny()
+    return HTMLResponse(SCRIPT_PAGE_HTML, headers=_NO_CACHE)
+
+
+async def _script_info(request: Request):
+    if not _authorized(request):
+        return _deny()
+    try:
+        return JSONResponse(await asyncio.to_thread(script_info), headers=_NO_CACHE)
+    except Exception as e:
+        logger.exception("decide: script info failed")
+        return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
+
+
+async def _script_log(request: Request):
+    if not _authorized(request):
+        return _deny()
+    if not _write_enabled():
+        return JSONResponse({"error": "read-only preview"}, status_code=403, headers=_NO_CACHE)
+    try:
+        info = await asyncio.to_thread(script_info)
+        res = await asyncio.to_thread(log_script, info)
+    except Exception as e:
+        logger.exception("decide: script log failed")
+        return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
+    return JSONResponse(res, headers=_NO_CACHE)
 
 
 async def _answer(request: Request):
@@ -513,6 +615,9 @@ def register(mcp) -> None:
     mcp.custom_route("/d/{token}/api/batch", methods=["GET"])(_batch)
     mcp.custom_route("/d/{token}/api/answer", methods=["POST"])(_answer)
     mcp.custom_route("/d/{token}/moves.ps1", methods=["GET"])(_script)
+    mcp.custom_route("/d/{token}/script", methods=["GET"])(_script_page)
+    mcp.custom_route("/d/{token}/api/script", methods=["GET"])(_script_info)
+    mcp.custom_route("/d/{token}/api/script/log", methods=["POST"])(_script_log)
     logger.info("decide: page enabled (write=%s)", _write_enabled())
 
 
@@ -642,16 +747,102 @@ function card(it){
   c.appendChild(row);
   return c;
 }
-function afterChange(){
-  const n = state.items.length;
-  renderAll();
-  if (n === 0) {
-    $('list').replaceChildren();
-    const d = el('div', 'done', 'Batch done.');
-    const b = el('button', '', 'Load next batch'); b.style.marginTop = '12px'; b.onclick = load;
-    d.appendChild(el('div')); d.appendChild(b); $('list').appendChild(d);
-  }
+let mode = 'queue';
+const SNOOZE_MS = 12 * 3600 * 1000;
+function snoozed(){
+  try {
+    const m = JSON.parse(localStorage.getItem('snooze') || '{}'), now = Date.now(), out = {};
+    for (const k in m) if (m[k] > now) out[k] = m[k];
+    return out;
+  } catch (e) { return {}; }
 }
+function setSnooze(agent, on){
+  try {
+    const m = snoozed();
+    if (on) m[agent] = Date.now() + SNOOZE_MS; else delete m[agent];
+    localStorage.setItem('snooze', JSON.stringify(m));
+  } catch (e) {}
+}
+function clearSnoozes(){ try { localStorage.removeItem('snooze'); } catch (e) {} }
+
+function afterChange(){ renderList(); }
+
+function groupCard(g){
+  const c = el('div', 'card');
+  c.appendChild(el('div', 'agent', g.agent));
+  c.appendChild(el('div', 'name', g.pending
+    ? g.pending + ' files need a decision'
+    : 'All decided — ready for the move script'));
+  const bits = [];
+  if (g.approved) bits.push(g.approved + ' approved so far');
+  if (g.your_call) bits.push(g.your_call + ' need your call');
+  if (bits.length) c.appendChild(el('div', 'meta', bits.join(' · ')));
+  c.appendChild(el('div', 'meta', 'Opens a short run: a few files at a time, then the script.'));
+  const row = el('div', 'row');
+  const open = el('button', 'yes', 'Open');
+  open.onclick = () => { mode = 'cleanup'; load(); };
+  const later = el('button', '', 'Not now');
+  later.onclick = () => { setSnooze(g.agent, true); renderList(); };
+  row.appendChild(open); row.appendChild(later); c.appendChild(row);
+  return c;
+}
+
+function backBar(){
+  const row = el('div', 'row');
+  const b = el('button', 'full', '← Back to queue');
+  b.onclick = () => { mode = 'queue'; load(); };
+  row.appendChild(b); return row;
+}
+
+function renderList(){
+  const list = $('list');
+  list.replaceChildren();
+  if (mode === 'cleanup') {
+    list.appendChild(backBar());
+    if (!state.items.length) { showDone(0); return; }
+    if (state.focus) list.appendChild(el('div', 'banner', 'Folder CleanUp · ' + state.focus));
+    state.items.forEach(it => list.appendChild(card(it)));
+    renderAll();
+    return;
+  }
+  const snz = snoozed();
+  const groups = (state.groups || []).filter(g => !snz[g.agent]);
+  const hidden = (state.groups || []).length - groups.length;
+  state.items.forEach(it => list.appendChild(card(it)));
+  groups.forEach(g => list.appendChild(groupCard(g)));
+  if (!state.items.length && !groups.length) {
+    const c = el('div', 'card');
+    c.appendChild(el('div', 'name', hidden ? 'Nothing else right now' : 'All clear'));
+    c.appendChild(el('div', 'meta', hidden ? 'You put ' + hidden + ' item(s) on hold with “Not now”.' : 'No agent is waiting on you.'));
+    list.appendChild(c);
+  }
+  if (hidden) {
+    const row = el('div', 'row');
+    const b = el('button', 'full', 'Show on-hold items (' + hidden + ')');
+    b.onclick = () => { clearSnoozes(); renderList(); };
+    row.appendChild(b); list.appendChild(row);
+  }
+  renderAll();
+}
+
+function showDone(saved){
+  $('all').replaceChildren();
+  const c = el('div', 'card');
+  c.appendChild(el('div', 'agent', 'Folder CleanUp'));
+  c.appendChild(el('div', 'name', saved ? 'Batch saved — ' + saved + ' decided' : 'Batch done'));
+  c.appendChild(el('div', 'meta', 'Repeat with another batch of proposals, or finish and get the move script for everything you approved.'));
+  const row = el('div', 'row');
+  const more = el('button', 'yes', 'Another batch'); more.onclick = load;
+  const fin = el('button', '', 'Finish → script');
+  fin.onclick = async () => {
+    fin.disabled = true; more.disabled = true;
+    try { await fetch(base + '/api/script/log', {method: 'POST'}); } catch (e) {}
+    location.href = base + '/script';
+  };
+  row.appendChild(more); row.appendChild(fin); c.appendChild(row);
+  $('list').appendChild(c);
+}
+
 function renderAll(){
   $('all').replaceChildren();
   const ok = state.items.filter(i => i.proposal);
@@ -664,47 +855,124 @@ function renderAll(){
       const res = await post(ok.map(i => payload(i, i.proposal.approve, i.proposal.handler)));
       const good = res.filter(r => r.status === 'ok' || r.status === 'already_decided').length;
       toast(good + ' saved' + (good < res.length ? ', ' + (res.length - good) + ' changed' : ''));
-      load();
+      if (mode === 'cleanup') { state.items = []; $('list').replaceChildren(backBar()); showDone(good); }
+      else load();
     } catch (e) { b.disabled = false; toast(e.message); }
   });
   $('all').appendChild(b);
 }
+
+function link(text, url) {
+  const a = document.createElement('a');
+  a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+  a.textContent = text;
+  return a;
+}
+const okUrl = u => u && /^https:\/\/docs\.google\.com\//.test(u);
+function setSub(d) {
+  const sub = $('sub');
+  sub.replaceChildren();
+  sub.append(d.pending_total + ' undecided in ');
+  if (okUrl(d.sheet_url)) sub.append(link('the sheet', d.sheet_url)); else sub.append('the sheet');
+  const counts = Object.entries(d.agent_counts || {});
+  if (counts.length) {
+    const line = el('div', 'meta', counts.map(([k, v]) => k + ' ' + v).join(' · '));
+    if (okUrl(d.queue_url) && counts.some(([k]) => k !== 'Folder CleanUp')) {
+      line.append(' · '); line.append(link('task queue', d.queue_url));
+    }
+    sub.append(line);
+  }
+}
 async function load(){
   $('sub').textContent = 'Loading…';
-  function link(text, url) {
-    const a = document.createElement('a');
-    a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-    a.textContent = text;
-    return a;
-  }
-  const okUrl = u => u && /^https:\/\/docs\.google\.com\//.test(u);
-  function setSub(d) {
-    const sub = $('sub');
-    sub.replaceChildren();
-    sub.append(d.pending_total + ' undecided in ');
-    if (okUrl(d.sheet_url)) sub.append(link('the sheet', d.sheet_url)); else sub.append('the sheet');
-    sub.append(' · showing ' + d.items.length);
-    const counts = Object.entries(d.agent_counts || {});
-    if (counts.length > 1 || (counts.length === 1 && counts[0][0] !== 'Folder CleanUp')) {
-      const line = el('div', 'meta', counts.map(([k, v]) => k + ' ' + v).join(' · '));
-      if (okUrl(d.queue_url) && counts.some(([k]) => k !== 'Folder CleanUp')) {
-        line.append(' · '); line.append(link('task queue', d.queue_url));
-      }
-      sub.append(line);
-    }
-  }
   try {
-    const r = await fetch(base + '/api/batch');
+    const r = await fetch(base + '/api/batch?view=' + mode);
     const d = await r.json();
     if (!r.ok) { banner(d.error, true); $('sub').textContent = ''; return; }
-    state = {items: d.items, write: d.write_enabled, sheetUrl: d.sheet_url};
+    state = {items: d.items, groups: d.groups || [], focus: d.focus || '',
+             write: d.write_enabled, sheetUrl: d.sheet_url};
     banner(d.write_enabled ? '' : 'Read-only preview — buttons are off.', false);
     setSub(d);
-    $('list').replaceChildren(...d.items.map(card));
-    renderAll();
-    if (!d.items.length) afterChange();
+    renderList();
   } catch (e) { banner('Could not load. Check your connection.', true); }
 }
 load();
 </script></body></html>
 """
+
+
+SCRIPT_PAGE_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Move script</title>
+<style>
+:root{--bg:#f6f6f4;--card:#fff;--ink:#1c1c1a;--mute:#6b6b66;--line:#e2e2dd;--acc:#2f4fd1;--ok:#1f7a4d;--code:#efefea}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--card:#1e1e1c;--ink:#ecece8;--mute:#9b9b94;--line:#33332f;--acc:#8ea2ff;--ok:#6fd0a0;--code:#2a2a27}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 -apple-system,system-ui,sans-serif;padding:16px max(16px,env(safe-area-inset-right)) 64px max(16px,env(safe-area-inset-left));max-width:760px}
+h1{font-size:20px;margin:4px 0 2px}
+.sub{color:var(--mute);font-size:14px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+.card h2{font-size:16px;margin:0 0 6px}
+.meta{color:var(--mute);font-size:14px}
+pre,textarea{width:100%;background:var(--code);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all;margin:8px 0}
+textarea{height:260px;white-space:pre;word-break:normal}
+button,a.btn{font:inherit;border:0;border-radius:12px;min-height:44px;padding:10px 14px;background:var(--acc);color:#fff;text-decoration:none;display:inline-block;cursor:pointer}
+button.alt{background:var(--line);color:var(--ink)}
+.ok{color:var(--ok)}
+a{color:var(--acc)}
+</style></head><body>
+<h1>Move script</h1>
+<div class="sub" id="sub">Loading…</div>
+<div id="steps"></div>
+<div class="card"><h2>The full script</h2>
+<div class="meta">Same text as the downloaded file and the latest entry in the “Script Log” tab of the sheet.</div>
+<textarea id="full" readonly></textarea>
+<button id="copyfull">Copy script</button></div>
+<p class="meta"><a id="back" href="#">← Back to decisions</a></p>
+<script>
+const base = location.pathname.replace(/\/script\/?$/, '');
+const $ = id => document.getElementById(id);
+function el(tag, cls, text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e;}
+async function copy(text, btn){
+  const old = btn.textContent;
+  try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
+  catch (e) { btn.textContent = 'Press and hold to copy'; }
+  setTimeout(() => btn.textContent = old, 1800);
+}
+function step(n, title, body, cmd){
+  const c = el('div','card'); c.appendChild(el('h2','', n + '. ' + title));
+  if (body) c.appendChild(el('div','meta', body));
+  if (cmd){
+    c.appendChild(el('pre','', cmd));
+    const b = el('button','alt','Copy command'); b.onclick = () => copy(cmd, b); c.appendChild(b);
+  }
+  $('steps').appendChild(c); return c;
+}
+$('back').href = base;
+(async () => {
+  try {
+    const r = await fetch(base + '/api/script'); const d = await r.json();
+    if (!r.ok) { $('sub').textContent = d.error || 'Could not load'; return; }
+    $('sub').textContent = d.moves + ' moves and ' + d.deletes + ' deletes approved. Deletes only go to a _to_delete folder.';
+    $('full').value = d.script;
+    $('copyfull').onclick = () => copy(d.script, $('copyfull'));
+    const url = location.origin + base + '/moves.ps1';
+    step(1, 'Open this page on your PC', 'The script runs on your Windows PC, not your phone. Open this same address there, or send yourself the link.',
+      location.href);
+    step(2, 'Open PowerShell', 'Press the Windows key, type PowerShell, press Enter.');
+    step(3, 'Download the script into Downloads', 'This fetches the current script from this page.',
+      'cd $env:USERPROFILE\\Downloads\nInvoke-WebRequest "' + url + '" -OutFile moves.ps1');
+    step(4, 'Preview — changes nothing', 'Lists every move and delete it would do. Check it against what you approved.',
+      '.\\moves.ps1');
+    step(5, 'Do it', 'Moves the files. Never overwrites, and skips anything missing. Writes a log and an undo script to Downloads\\_cleanup_logs.',
+      '.\\moves.ps1 -Apply');
+    step(6, 'If something looks wrong', 'Run the undo script it printed at the end, for example:',
+      '.\\_cleanup_logs\\undo-<time>.ps1');
+    step('+', 'If Windows blocks the script', 'Use this instead of steps 4 and 5 (add -Apply to the end for step 5).',
+      'powershell -ExecutionPolicy Bypass -File .\\moves.ps1');
+  } catch (e) { $('sub').textContent = 'Could not load. Check your connection.'; }
+})();
+</script></body></html>"""

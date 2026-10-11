@@ -66,14 +66,20 @@ class DecideTests(unittest.TestCase):
             p.stop()
 
     def test_batch_skips_decided_and_flags_manual(self):
-        d = decide.get_batch()
-        items = d["items"]
-        names = [i["name"] for i in items]
-        # small-batch rule: cleanup cards come from one category/subfolder
-        cleanup = [i for i in items if i["kind"] != "task"]
+        # queue view: task cards only, plus ONE summary group for Folder CleanUp
+        q = decide.get_batch()
+        self.assertTrue(all(i["kind"] == "task" for i in q["items"]))
+        self.assertIn("Call the dentist", [i["name"] for i in q["items"]])
+        self.assertEqual(len(q["groups"]), 1)
+        self.assertEqual(q["groups"][0]["agent"], "Folder CleanUp")
+        self.assertEqual(q["groups"][0]["pending"], 5)
+        self.assertEqual(q["groups"][0]["your_call"], 2)  # lease (Legal) and dup
+        # cleanup view: small-batch rule, one category/subfolder
+        d = decide.get_batch(view="cleanup")
+        cleanup = d["items"]
+        self.assertTrue(cleanup and all(i["kind"] != "task" for i in cleanup))
         self.assertEqual(len({(i["tab"], i["category"], i["subfolder"]) for i in cleanup}), 1)
         self.assertEqual(d["focus"].split(" / ")[0], cleanup[0]["category"])
-        self.assertIn("Call the dentist", names)
         self.assertEqual(d["pending_total"], 8)
         # every pending cleanup row is still reachable via the focus rotation
         seen = set()
@@ -96,6 +102,51 @@ class DecideTests(unittest.TestCase):
         self.assertNotIn("lease.pdf", r.text)  # undecided rows excluded
         self.assertIn("-Apply", r.text)
 
+    def _approve_first_move(self):
+        self.fake.tabs["Organize Proposal"][1][0:2] = ["Y", "Coach"]
+
+    def test_script_page_and_info(self):
+        self.assertEqual(self.client.get("/d/wrong/script").status_code, 404)
+        self.assertEqual(self.client.get("/d/wrong/api/script").status_code, 404)
+        self._approve_first_move()
+        page = self.client.get("/d/secret/script")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Copy script", page.text)
+        self.assertIn("-OutFile moves.ps1", page.text)
+        info = self.client.get("/d/secret/api/script").json()
+        self.assertEqual((info["moves"], info["deletes"]), (1, 0))
+        self.assertIn("a.jpg", info["script"])
+
+    def test_script_log_appends_once_and_creates_tab(self):
+        from unittest.mock import MagicMock
+        self._approve_first_move()
+        svc = MagicMock()
+        ss = svc.spreadsheets.return_value
+        ss.get.return_value.execute.return_value = {"sheets": [{"properties": {"title": "Captured"}}]}
+        ss.values.return_value.get.return_value.execute.return_value = {"values": [["Script"]]}
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            r = self.client.post("/d/secret/api/script/log")
+        self.assertEqual(r.json(), {"logged": True})
+        ss.batchUpdate.assert_called_once()  # tab created
+        # the log lives in Downloads_Cleanup_Proposal, not the pipeline sheet
+        self.assertEqual(ss.get.call_args.kwargs["spreadsheetId"], decide.DEFAULT_SHEET_ID)
+        row = ss.values.return_value.append.call_args.kwargs["body"]["values"][0]
+        self.assertEqual((row[1], row[2]), (1, 0))
+        self.assertIn("a.jpg", row[3])
+        # identical latest entry is not logged twice
+        ss.values.return_value.get.return_value.execute.return_value = {"values": [["Script"], [row[3]]]}
+        ss.get.return_value.execute.return_value = {"sheets": [{"properties": {"title": "Script Log"}}]}
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            r = self.client.post("/d/secret/api/script/log")
+        self.assertFalse(r.json()["logged"])
+
+    def test_batch_route_views(self):
+        q = self.client.get("/d/secret/api/batch").json()
+        self.assertEqual(q["view"], "queue")
+        c = self.client.get("/d/secret/api/batch?view=cleanup").json()
+        self.assertEqual(c["view"], "cleanup")
+        self.assertTrue(c["focus"])
+
     def test_batch_includes_sheet_link(self):
         url = decide.get_batch()["sheet_url"]
         self.assertTrue(url.startswith("https://docs.google.com/spreadsheets/d/"))
@@ -117,23 +168,23 @@ class DecideTests(unittest.TestCase):
         self.assertNotIn("Already done", by)
 
     def test_agent_counts_and_cap_round_robin(self):
-        with patch.dict(os.environ, {"DECIDE_AGENT_CAP": "2"}):
-            d = decide.get_batch(5)
+        with patch.dict(os.environ, {"DECIDE_AGENT_CAP": "1"}):
+            d = decide.get_batch(3)
         self.assertEqual(d["agent_counts"]["Folder CleanUp"], 5)
         self.assertEqual(d["agent_counts"]["Weekly Routine"], 2)
         agents = [i["agent"] for i in d["items"]]
-        self.assertLessEqual(agents.count("Folder CleanUp"), 2)
-        self.assertEqual(len(agents), 4)  # all 4 task cards + capped cleanup
+        self.assertEqual(len(agents), 3)
+        self.assertNotIn("Folder CleanUp", agents)  # cleanup lives behind its own card
         self.assertIn("Capture Sweep", agents)
         self.assertIn("Weekly Routine", agents)
 
     def test_cap_relaxes_when_one_agent_has_all_the_work(self):
         self.fake.tabs["Task Queue"] = [QUEUE[0]]
-        d = decide.get_batch(4)
+        d = decide.get_batch(4, view="cleanup")
         self.assertGreaterEqual(len(d["items"]), 1)
         self.assertEqual(len({(i["category"], i["subfolder"]) for i in d["items"]}), 1)
         with patch.dict(os.environ, {"DECIDE_AGENT_CAP": "1"}):
-            self.assertEqual(len(decide.get_batch(4)["items"]),
+            self.assertEqual(len(decide.get_batch(4, view="cleanup")["items"]),
                              len(d["items"]))
 
     def test_missing_queue_tab_does_not_break_cleanup(self):
