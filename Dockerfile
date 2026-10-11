@@ -40,6 +40,6 @@ FROM base AS runner
 
 COPY --from=builder /app/dist/*.whl /app/
 
-RUN uv pip install /app/*.whl
-
+RUN RUN uv pip install "mcp<2" /app/*.whl
+ENV HOST=0.0.0.0
 CMD ["uv", "run", "mcp-google-sheets", "--transport", "sse"]
