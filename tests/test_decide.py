@@ -66,17 +66,35 @@ class DecideTests(unittest.TestCase):
             p.stop()
 
     def test_batch_skips_decided_and_flags_manual(self):
-        items = decide.get_batch()["items"]
+        d = decide.get_batch()
+        items = d["items"]
         names = [i["name"] for i in items]
-        self.assertEqual(sorted(names), sorted([
-            "a.jpg", "lease.pdf", "dup.pdf", "half.pdf", "~$x.docx",
-            "Call the dentist", "Archive Q3 notes", "Pick the 7 for next week"]))
-        by = {i["name"]: i for i in items}
-        self.assertIsNotNone(by["a.jpg"]["proposal"])
-        self.assertIsNone(by["lease.pdf"]["proposal"])
-        self.assertIsNone(by["dup.pdf"]["proposal"])
-        self.assertEqual(by["~$x.docx"]["row"], 3)
-        self.assertEqual(by["~$x.docx"]["kind"], "delete")
+        # small-batch rule: cleanup cards come from one category/subfolder
+        cleanup = [i for i in items if i["kind"] != "task"]
+        self.assertEqual(len({(i["tab"], i["category"], i["subfolder"]) for i in cleanup}), 1)
+        self.assertEqual(d["focus"].split(" / ")[0], cleanup[0]["category"])
+        self.assertIn("Call the dentist", names)
+        self.assertEqual(d["pending_total"], 8)
+        # every pending cleanup row is still reachable via the focus rotation
+        seen = set()
+        for it in decide.parse_tab("Organize Proposal", self.fake.tabs["Organize Proposal"]) + \
+                decide.parse_tab("Delete Candidates", self.fake.tabs["Delete Candidates"]):
+            seen.add(it["name"])
+            if it["name"] == "a.jpg":
+                self.assertIsNotNone(it["proposal"])
+            if it["name"] in ("lease.pdf", "dup.pdf"):
+                self.assertIsNone(it["proposal"])
+            if it["name"] == "~$x.docx":
+                self.assertEqual((it["row"], it["kind"]), (3, "delete"))
+        self.assertEqual(seen, {"a.jpg", "lease.pdf", "dup.pdf", "half.pdf", "~$x.docx"})
+
+    def test_moves_script_route_only_includes_y_coach_rows(self):
+        self.assertEqual(self.client.get("/d/wrong/moves.ps1").status_code, 404)
+        r = self.client.get("/d/secret/moves.ps1")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("attachment", r.headers["content-disposition"])
+        self.assertNotIn("lease.pdf", r.text)  # undecided rows excluded
+        self.assertIn("-Apply", r.text)
 
     def test_batch_includes_sheet_link(self):
         url = decide.get_batch()["sheet_url"]
@@ -88,6 +106,7 @@ class DecideTests(unittest.TestCase):
 
     def test_task_queue_items_and_proposals(self):
         by = {i["name"]: i for i in decide.get_batch(50)["items"]}
+        self.assertNotIn("Already done", by)
         t = by["Call the dentist"]
         self.assertEqual((t["agent"], t["kind"], t["path"]), ("Capture Sweep", "task", "t-1"))
         self.assertEqual(t["proposal"], {"approve": "Y", "handler": "Me"})
@@ -104,16 +123,18 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(d["agent_counts"]["Weekly Routine"], 2)
         agents = [i["agent"] for i in d["items"]]
         self.assertLessEqual(agents.count("Folder CleanUp"), 2)
-        self.assertEqual(len(agents), 5)
+        self.assertEqual(len(agents), 4)  # all 4 task cards + capped cleanup
         self.assertIn("Capture Sweep", agents)
         self.assertIn("Weekly Routine", agents)
 
     def test_cap_relaxes_when_one_agent_has_all_the_work(self):
         self.fake.tabs["Task Queue"] = [QUEUE[0]]
         d = decide.get_batch(4)
-        self.assertEqual(len(d["items"]), 4)  # cap 5 >= 4 anyway
+        self.assertGreaterEqual(len(d["items"]), 1)
+        self.assertEqual(len({(i["category"], i["subfolder"]) for i in d["items"]}), 1)
         with patch.dict(os.environ, {"DECIDE_AGENT_CAP": "1"}):
-            self.assertEqual(len(decide.get_batch(4)["items"]), 4)
+            self.assertEqual(len(decide.get_batch(4)["items"]),
+                             len(d["items"]))
 
     def test_missing_queue_tab_does_not_break_cleanup(self):
         del self.fake.tabs["Task Queue"]
@@ -196,3 +217,32 @@ class DecideTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_build_script_escapes_and_refuses_escapes():
+    acts = [
+        {"kind": "move", "src": "Downloads/it's.jpg", "dest": "Downloads/Images/it's.jpg"},
+        {"kind": "delete", "src": "Downloads/~$1.pdf", "dest": ""},
+        {"kind": "move", "src": "Downloads/../x", "dest": "Downloads/y"},
+        {"kind": "move", "src": "Downloads/a", "dest": "C:/Windows/a"},
+        {"kind": "move", "src": "Other/a", "dest": "Downloads/a"},
+    ]
+    s = decide.build_script(acts)
+    assert "it''s.jpg" in s and "~$1.pdf" in s
+    assert "..\\" not in s and "Downloads/../x" not in s
+    assert "Windows" not in s and "Other/a" not in s
+    assert "[switch]$Apply" in s
+
+
+def test_focus_cleanup_picks_one_group():
+    def it(cat, sub, prop=True, kind="move"):
+        return {"tab": "Organize Proposal", "kind": kind, "category": cat,
+                "subfolder": sub, "proposal": {"approve": "Y"} if prop else None,
+                "agent": decide.CLEANUP_AGENT}
+    task = {"tab": "Task Queue", "kind": "task", "category": "", "subfolder": "",
+            "proposal": None, "agent": "X"}
+    items = [it("Legal", "", False), it("Images", "Photos"), it("Images", "Photos"),
+             it("Docs", "BME"), task]
+    kept, label = decide._focus_cleanup(items)
+    assert label == "Images / Photos"
+    assert task in kept and len(kept) == 3
