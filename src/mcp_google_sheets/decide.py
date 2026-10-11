@@ -12,6 +12,10 @@ Routes (all require the secret token in the path):
 Environment:
     DECIDE_TOKEN     secret path token. Unset => routes are not registered.
     DECIDE_SHEET_ID  approval spreadsheet id (default: Downloads_Cleanup_Proposal)
+    QUEUE_SHEET_ID   spreadsheet holding the shared "Task Queue" tab that any
+                     agent can write proposals into (default: GTD CCORE Pipeline)
+    DECIDE_AGENT_CAP max cards one agent may fill in a batch before others
+                     get a turn (default 5)
     DECIDE_WRITE     "1" to allow writes. Anything else => read-only preview.
 """
 
@@ -32,11 +36,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_SHEET_ID = "1TgmcojGtlXWOK2rKZFli4U9glUBwYkw9bje2x9aWf3s"
 BATCH_SIZE = 15
 
+DEFAULT_QUEUE_SHEET_ID = "18DX6GMnxn2hadduPZevCv36Ecu6y76OzzojwRmZjhCU"
+AGENT_CAP = 5
+QUEUE_TAB = "Task Queue"
+
 # tab name -> (1-based header row, kind of action)
 TABS = {
     "Organize Proposal": (1, "move"),
     "Delete Candidates": (2, "delete"),
+    QUEUE_TAB: (1, "task"),
 }
+CLEANUP_AGENT = "Folder CleanUp"
 
 H_APPROVE = "approve? (y/n)"
 H_HANDLER = "handler (me/coach)"
@@ -55,6 +65,21 @@ _service_cache: Dict[str, Any] = {}
 # ---------------------------------------------------------------- settings
 def _sheet_id() -> str:
     return os.environ.get("DECIDE_SHEET_ID") or DEFAULT_SHEET_ID
+
+
+def _queue_sheet_id() -> str:
+    return os.environ.get("QUEUE_SHEET_ID") or DEFAULT_QUEUE_SHEET_ID
+
+
+def _agent_cap() -> int:
+    try:
+        return max(1, int(os.environ.get("DECIDE_AGENT_CAP", AGENT_CAP)))
+    except ValueError:
+        return AGENT_CAP
+
+
+def _sheet_for(tab: str) -> str:
+    return _queue_sheet_id() if tab == QUEUE_TAB else _sheet_id()
 
 
 def _write_enabled() -> bool:
@@ -88,15 +113,22 @@ def _sheets_service():
 def _read_tab(tab: str) -> List[List[str]]:
     """All values of a tab as a list of rows (row 1 is index 0)."""
     res = _sheets_service().spreadsheets().values().get(
-        spreadsheetId=_sheet_id(), range=f"'{tab}'!A:I").execute()
+        spreadsheetId=_sheet_for(tab), range=f"'{tab}'!A:Z").execute()
     return res.get("values", [])
 
 
 def _write_cells(updates: List[Dict[str, Any]]) -> None:
-    """updates: [{"range": "'Tab'!A5:B5", "values": [["Y","Coach"]]}]"""
-    _sheets_service().spreadsheets().values().batchUpdate(
-        spreadsheetId=_sheet_id(),
-        body={"valueInputOption": "RAW", "data": updates}).execute()
+    """updates: [{"tab": "Tab", "range": "'Tab'!A5:B5", "values": [["Y","Coach"]]}]
+    Grouped per spreadsheet because the cleanup tabs and the Task Queue live
+    in different spreadsheets."""
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for u in updates:
+        groups.setdefault(_sheet_for(u.get("tab", "")), []).append(
+            {"range": u["range"], "values": u["values"]})
+    for sheet_id, data in groups.items():
+        _sheets_service().spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "RAW", "data": data}).execute()
 
 
 # ------------------------------------------------------------------- logic
@@ -117,6 +149,10 @@ def _proposal(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
     return {"approve": "Y", "handler": "Coach"}
 
 
+def _safe_link(url: str) -> str:
+    return url if url.startswith("https://") else ""
+
+
 def parse_tab(tab: str, values: List[List[str]]) -> List[Dict[str, Any]]:
     header_row, kind = TABS[tab]
     if len(values) < header_row:
@@ -125,10 +161,13 @@ def parse_tab(tab: str, values: List[List[str]]) -> List[Dict[str, Any]]:
     ia, ih = cols.get(H_APPROVE), cols.get(H_HANDLER)
     if ia is None or ih is None:
         raise ValueError(f"'{tab}' is missing the Approve?/Handler columns")
-    ip = cols.get("current path")
+    ip = cols.get("id" if kind == "task" else "current path")
     icat, isub = cols.get("category"), cols.get("subfolder")
     idest, isize = cols.get("proposed new path"), cols.get("size")
     imod, inote = cols.get("modified"), cols.get("notes")
+    iagent, ititle = cols.get("agent"), cols.get("title")
+    idetail, ipro = cols.get("detail"), cols.get("proposed handler")
+    ineeds, ilink = cols.get("needs you"), cols.get("link")
 
     items = []
     for idx in range(header_row, len(values)):
@@ -139,6 +178,24 @@ def parse_tab(tab: str, values: List[List[str]]) -> List[Dict[str, Any]]:
         approve, handler = _cell(row, ia), _cell(row, ih)
         if approve and handler:
             continue  # fully decided
+        if kind == "task":
+            title = _cell(row, ititle) or path
+            reason = "Needs your judgment" if _cell(row, ineeds).lower() in (
+                "y", "yes", "true", "1") else ""
+            hint = _cell(row, ipro)
+            item = {
+                "tab": tab, "row": idx + 1, "kind": kind, "path": path,
+                "name": title, "agent": _cell(row, iagent) or "Agent",
+                "category": "", "subfolder": "", "dest": "", "size": "",
+                "modified": "", "notes": _cell(row, idetail),
+                "link": _safe_link(_cell(row, ilink)),
+                "approve": approve, "handler": handler, "manual_reason": reason,
+            }
+            item["proposal"] = (
+                {"approve": "Y", "handler": hint}
+                if hint in ("Me", "Coach") and not reason else None)
+            items.append(item)
+            continue
         category, sub, notes = _cell(row, icat), _cell(row, isub), _cell(row, inote)
         reason = ""
         blob = f"{category} {sub}".lower()
@@ -148,10 +205,10 @@ def parse_tab(tab: str, values: List[List[str]]) -> List[Dict[str, Any]]:
             reason = "Possible duplicate"
         item = {
             "tab": tab, "row": idx + 1, "kind": kind, "path": path,
-            "name": path.rsplit("/", 1)[-1],
+            "name": path.rsplit("/", 1)[-1], "agent": CLEANUP_AGENT,
             "category": category, "subfolder": sub,
             "dest": _cell(row, idest), "size": _cell(row, isize),
-            "modified": _cell(row, imod), "notes": notes,
+            "modified": _cell(row, imod), "notes": notes, "link": "",
             "approve": approve, "handler": handler,
             "manual_reason": reason,
         }
@@ -160,13 +217,47 @@ def parse_tab(tab: str, values: List[List[str]]) -> List[Dict[str, Any]]:
     return items
 
 
+def _mix(items: List[Dict[str, Any]], n: int, cap: int) -> List[Dict[str, Any]]:
+    """Pick n cards, at most `cap` per agent, round-robin across agents so no
+    single agent crowds out the others. If that leaves the batch short (e.g.
+    only one agent has work), fill the rest from whoever still has items."""
+    by_agent: Dict[str, List[Dict[str, Any]]] = {}
+    for it in items:
+        by_agent.setdefault(it["agent"], []).append(it)
+    picked: List[Dict[str, Any]] = []
+    taken: Dict[str, int] = {a: 0 for a in by_agent}
+    progress = True
+    while len(picked) < n and progress:
+        progress = False
+        for agent, queue in by_agent.items():
+            if len(picked) >= n:
+                break
+            if queue and taken[agent] < cap:
+                picked.append(queue.pop(0))
+                taken[agent] += 1
+                progress = True
+    for agent, queue in by_agent.items():  # second pass: ignore the cap
+        while queue and len(picked) < n:
+            picked.append(queue.pop(0))
+    return picked
+
+
 def get_batch(n: int = BATCH_SIZE) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
     for tab in TABS:
-        items.extend(parse_tab(tab, _read_tab(tab)))
-    return {"items": items[:n], "pending_total": len(items),
-            "write_enabled": _write_enabled(),
-            "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit"}
+        try:
+            items.extend(parse_tab(tab, _read_tab(tab)))
+        except Exception:
+            if tab != QUEUE_TAB:
+                raise
+            logger.warning("decide: Task Queue tab unavailable; skipping", exc_info=True)
+    counts: Dict[str, int] = {}
+    for it in items:
+        counts[it["agent"]] = counts.get(it["agent"], 0) + 1
+    return {"items": _mix(items, n, _agent_cap()), "pending_total": len(items),
+            "agent_counts": counts, "write_enabled": _write_enabled(),
+            "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit",
+            "queue_url": f"https://docs.google.com/spreadsheets/d/{_queue_sheet_id()}/edit"}
 
 
 def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -192,18 +283,20 @@ def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             values = by_tab[tab]
             cols = _columns(values[TABS[tab][0] - 1])
             cur = values[row - 1] if row - 1 < len(values) else []
-            if _cell(cur, cols.get("current path")) != ans.get("path"):
+            idcol = "id" if TABS[tab][1] == "task" else "current path"
+            if _cell(cur, cols.get(idcol)) != ans.get("path"):
                 results.append({**rid, "status": "stale"})
                 continue
             ia, ih = cols[H_APPROVE], cols[H_HANDLER]
             if _cell(cur, ia) and _cell(cur, ih):
                 results.append({**rid, "status": "already_decided"})
                 continue
-            if ih != ia + 1:
+            if ih != ia + 1 or ih > 25:
                 results.append({**rid, "status": "invalid"})
                 continue
-            col = lambda i: chr(ord("A") + i)  # columns A..I only
+            col = lambda i: chr(ord("A") + i)  # columns A..Z
             updates.append({
+                "tab": tab,
                 "range": f"'{tab}'!{col(ia)}{row}:{col(ih)}{row}",
                 "values": [[approve, handler]]})
             results.append({**rid, "status": "ok"})
@@ -316,6 +409,8 @@ button:disabled{opacity:.45}
 .all{width:100%;background:var(--acc);color:#fff;font-weight:600;min-height:56px;margin-bottom:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
 .name{font-weight:600;word-break:break-word}
+.agent{font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--acc);margin-bottom:4px;font-weight:600}
+a.meta{display:inline-block;margin-top:6px;color:var(--acc)}
 .meta{color:var(--mute);font-size:13px;margin-top:2px;word-break:break-word}
 .tag{display:inline-block;font-size:12px;border-radius:6px;padding:2px 7px;margin:8px 6px 0 0;background:var(--line)}
 .tag.warn{background:var(--warnbg);color:var(--warn)}
@@ -385,12 +480,21 @@ function skip(it, card){ card.remove(); state.items = state.items.filter(x => x 
 function card(it){
   const c = el('div', 'card');
   c.appendChild(el('div', 'name', it.name));
-  const where = it.kind === 'delete' ? 'Delete' : '→ ' + (it.dest || it.category);
-  c.appendChild(el('div', 'meta', where));
-  c.appendChild(el('div', 'meta', [it.size, it.modified].filter(Boolean).join(' · ')));
-  c.appendChild(el('span', 'tag' + (it.kind === 'delete' ? ' del' : ''), it.kind === 'delete' ? 'Delete' : 'Move'));
+  c.insertBefore(el('div', 'agent', it.agent || 'Agent'), c.firstChild);
+  if (it.kind !== 'task') {
+    const where = it.kind === 'delete' ? 'Delete' : '→ ' + (it.dest || it.category);
+    c.appendChild(el('div', 'meta', where));
+    c.appendChild(el('div', 'meta', [it.size, it.modified].filter(Boolean).join(' · ')));
+  }
+  c.appendChild(el('span', 'tag' + (it.kind === 'delete' ? ' del' : ''),
+    it.kind === 'delete' ? 'Delete' : (it.kind === 'task' ? 'Task' : 'Move')));
   if (it.manual_reason) c.appendChild(el('span', 'tag warn', it.manual_reason + ' — your call'));
   if (it.notes) c.appendChild(el('div', 'meta', it.notes));
+  if (it.link && /^https:\/\//.test(it.link)) {
+    const a = el('a', 'meta', 'Open details');
+    a.href = it.link; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    c.appendChild(a);
+  }
   const row = el('div', 'row');
   const mk = (label, cls, a, h, full) => {
     const b = el('button', cls + (full ? ' full' : ''), label);
@@ -420,7 +524,7 @@ function renderAll(){
   $('all').replaceChildren();
   const ok = state.items.filter(i => i.proposal);
   if (!ok.length) return;
-  const b = el('button', 'all', 'Accept all ' + ok.length + ' proposals (Coach handles)');
+  const b = el('button', 'all', 'Accept all ' + ok.length + ' proposals');
   b.disabled = !state.write;
   b.addEventListener('click', async () => {
     b.disabled = true;
@@ -435,17 +539,27 @@ function renderAll(){
 }
 async function load(){
   $('sub').textContent = 'Loading…';
-  function setSub(total, shown, url) {
+  function link(text, url) {
+    const a = document.createElement('a');
+    a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
+    a.textContent = text;
+    return a;
+  }
+  const okUrl = u => u && /^https:\/\/docs\.google\.com\//.test(u);
+  function setSub(d) {
     const sub = $('sub');
     sub.replaceChildren();
-    sub.append(total + ' undecided in ');
-    if (url && /^https:\/\/docs\.google\.com\//.test(url)) {
-      const a = document.createElement('a');
-      a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-      a.textContent = 'the sheet';
-      sub.append(a);
-    } else { sub.append('the sheet'); }
-    sub.append(' · showing ' + shown);
+    sub.append(d.pending_total + ' undecided in ');
+    if (okUrl(d.sheet_url)) sub.append(link('the sheet', d.sheet_url)); else sub.append('the sheet');
+    sub.append(' · showing ' + d.items.length);
+    const counts = Object.entries(d.agent_counts || {});
+    if (counts.length > 1 || (counts.length === 1 && counts[0][0] !== 'Folder CleanUp')) {
+      const line = el('div', 'meta', counts.map(([k, v]) => k + ' ' + v).join(' · '));
+      if (okUrl(d.queue_url) && counts.some(([k]) => k !== 'Folder CleanUp')) {
+        line.append(' · '); line.append(link('task queue', d.queue_url));
+      }
+      sub.append(line);
+    }
   }
   try {
     const r = await fetch(base + '/api/batch');
@@ -453,7 +567,7 @@ async function load(){
     if (!r.ok) { banner(d.error, true); $('sub').textContent = ''; return; }
     state = {items: d.items, write: d.write_enabled, sheetUrl: d.sheet_url};
     banner(d.write_enabled ? '' : 'Read-only preview — buttons are off.', false);
-    setSub(d.pending_total, d.items.length, d.sheet_url);
+    setSub(d);
     $('list').replaceChildren(...d.items.map(card));
     renderAll();
     if (!d.items.length) afterChange();
