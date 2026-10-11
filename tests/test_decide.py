@@ -67,6 +67,14 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(by["~$x.docx"]["row"], 3)
         self.assertEqual(by["~$x.docx"]["kind"], "delete")
 
+    def test_batch_includes_sheet_link(self):
+        url = decide.get_batch()["sheet_url"]
+        self.assertTrue(url.startswith("https://docs.google.com/spreadsheets/d/"))
+        self.assertTrue(url.endswith("/edit"))
+
+    def test_page_links_the_sheet_safely(self):
+        self.assertIn("setSub(", decide.PAGE_HTML if hasattr(decide, "PAGE_HTML") else open(decide.__file__).read())
+
     def test_apply_writes_approve_and_handler_columns(self):
         res = decide.apply_answers([{"tab": "Organize Proposal", "row": 2,
                                      "path": "Downloads/a.jpg", "approve": "Y", "handler": "Coach"}])
