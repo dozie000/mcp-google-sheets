@@ -366,21 +366,29 @@ def _ps(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def build_script(actions: List[Dict[str, str]]) -> str:
-    """PowerShell that applies approved actions safely: dry run unless
-    -Apply, never overwrites, deletes only go to a _to_delete folder, and
-    every real move is logged with a ready-made undo script."""
-    lines = []
+def safe_actions(actions: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Drop anything that could leave the Downloads tree."""
+    out = []
     for a in actions:
         parts = [a["src"], a["dest"]]
         if any(p.startswith(("/", "\\")) or ".." in p.replace("\\", "/").split("/")
                or ":" in p for p in parts if p):
-            continue  # refuse anything that could leave the Downloads tree
+            continue
         if not a["src"].startswith("Downloads/"):
             continue
         if a["kind"] == "move" and not a["dest"].startswith("Downloads/"):
             continue
-        lines.append(f"    @{{ Kind={_ps(a['kind'])}; Src={_ps(a['src'])}; Dest={_ps(a['dest'])} }}")
+        out.append(a)
+    return out
+
+
+def build_script(actions: List[Dict[str, str]]) -> str:
+    """PowerShell that applies approved actions safely: dry run unless
+    -Apply, never overwrites, deletes only go to a _to_delete folder, and
+    every real move is logged with a ready-made undo script."""
+    lines = [
+        f"    @{{ Kind={_ps(a['kind'])}; Src={_ps(a['src'])}; Dest={_ps(a['dest'])} }}"
+        for a in safe_actions(actions)]
     body = ",\n".join(lines)
     return f"""# Approved cleanup moves (generated from your Y + Coach rows).
 # Dry run by default: shows what WOULD happen and changes nothing.
@@ -392,8 +400,8 @@ $actions = @(
 {body}
 )
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$logDir = Join-Path $Root 'Downloads\_cleanup_logs'
-$trash  = Join-Path $Root 'Downloads\_to_delete'
+$logDir = Join-Path $Root 'Downloads\\_cleanup_logs'
+$trash  = Join-Path $Root 'Downloads\\_to_delete'
 $log = @(); $undo = @(); $moved = 0; $skipped = 0
 foreach ($a in $actions) {{
     $src = Join-Path $Root ($a.Src -replace '/', '\\')
@@ -422,6 +430,50 @@ if ($Apply -and $moved -gt 0) {{
     Write-Host "Preview only. $($actions.Count) approved, $skipped would be skipped. Re-run with -Apply to do it."
 }}
 """
+
+
+SCRIPT_LOG_TAB = "Script Log"
+SCRIPT_LOG_HEADER = ["Logged UTC", "Moves", "Deletes (to _to_delete)", "Script"]
+MAX_CELL = 45000
+
+
+def script_info() -> Dict[str, Any]:
+    acts = safe_actions(approved_actions())
+    return {"script": build_script(acts),
+            "moves": sum(1 for a in acts if a["kind"] == "move"),
+            "deletes": sum(1 for a in acts if a["kind"] == "delete")}
+
+
+def log_script(info: Dict[str, Any]) -> Dict[str, Any]:
+    """Append the generated script to the 'Script Log' tab of the pipeline
+    sheet (creating the tab if needed) so it can be copied cleanly from the
+    sheet. An identical script as the latest entry is not logged twice."""
+    import datetime as _dt
+    svc = _sheets_service().spreadsheets()
+    sid = _queue_sheet_id()
+    with _write_lock:
+        meta = svc.get(spreadsheetId=sid, fields="sheets.properties.title").execute()
+        titles = {x["properties"]["title"] for x in meta.get("sheets", [])}
+        if SCRIPT_LOG_TAB not in titles:
+            svc.batchUpdate(spreadsheetId=sid, body={"requests": [
+                {"addSheet": {"properties": {"title": SCRIPT_LOG_TAB}}}]}).execute()
+            svc.values().update(
+                spreadsheetId=sid, range=f"'{SCRIPT_LOG_TAB}'!A1:D1",
+                valueInputOption="RAW", body={"values": [SCRIPT_LOG_HEADER]}).execute()
+        text = info["script"]
+        if len(text) > MAX_CELL:
+            text = ("# Script too long for one cell. Open the decision page's "
+                    "/script page to copy it.")
+        rows = svc.values().get(
+            spreadsheetId=sid, range=f"'{SCRIPT_LOG_TAB}'!D:D").execute().get("values", [])
+        if len(rows) > 1 and rows[-1] and rows[-1][0] == text:
+            return {"logged": False, "reason": "same as latest entry"}
+        now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        svc.values().append(
+            spreadsheetId=sid, range=f"'{SCRIPT_LOG_TAB}'!A:D",
+            valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+            body={"values": [[now, info["moves"], info["deletes"], text]]}).execute()
+    return {"logged": True}
 
 
 # --------------------------------------------------------------------- web
@@ -476,6 +528,36 @@ async def _script(request: Request):
     return PlainTextResponse(build_script(actions), headers=headers)
 
 
+async def _script_page(request: Request):
+    if not _authorized(request):
+        return _deny()
+    return HTMLResponse(SCRIPT_PAGE_HTML, headers=_NO_CACHE)
+
+
+async def _script_info(request: Request):
+    if not _authorized(request):
+        return _deny()
+    try:
+        return JSONResponse(await asyncio.to_thread(script_info), headers=_NO_CACHE)
+    except Exception as e:
+        logger.exception("decide: script info failed")
+        return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
+
+
+async def _script_log(request: Request):
+    if not _authorized(request):
+        return _deny()
+    if not _write_enabled():
+        return JSONResponse({"error": "read-only preview"}, status_code=403, headers=_NO_CACHE)
+    try:
+        info = await asyncio.to_thread(script_info)
+        res = await asyncio.to_thread(log_script, info)
+    except Exception as e:
+        logger.exception("decide: script log failed")
+        return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
+    return JSONResponse(res, headers=_NO_CACHE)
+
+
 async def _answer(request: Request):
     if not _authorized(request):
         return _deny()
@@ -513,6 +595,9 @@ def register(mcp) -> None:
     mcp.custom_route("/d/{token}/api/batch", methods=["GET"])(_batch)
     mcp.custom_route("/d/{token}/api/answer", methods=["POST"])(_answer)
     mcp.custom_route("/d/{token}/moves.ps1", methods=["GET"])(_script)
+    mcp.custom_route("/d/{token}/script", methods=["GET"])(_script_page)
+    mcp.custom_route("/d/{token}/api/script", methods=["GET"])(_script_info)
+    mcp.custom_route("/d/{token}/api/script/log", methods=["POST"])(_script_log)
     logger.info("decide: page enabled (write=%s)", _write_enabled())
 
 
@@ -645,12 +730,23 @@ function card(it){
 function afterChange(){
   const n = state.items.length;
   renderAll();
-  if (n === 0) {
-    $('list').replaceChildren();
-    const d = el('div', 'done', 'Batch done.');
-    const b = el('button', '', 'Load next batch'); b.style.marginTop = '12px'; b.onclick = load;
-    d.appendChild(el('div')); d.appendChild(b); $('list').appendChild(d);
-  }
+  if (n === 0) showDone(0);
+}
+function showDone(saved){
+  $('all').replaceChildren(); $('list').replaceChildren();
+  const c = el('div', 'card');
+  c.appendChild(el('div', 'name', saved ? 'Batch saved — ' + saved + ' decided' : 'Batch done'));
+  c.appendChild(el('div', 'meta', 'Repeat with another batch of proposals, or finish and get the move script for everything you approved.'));
+  const row = el('div', 'row');
+  const more = el('button', 'yes', 'Another batch'); more.onclick = load;
+  const fin = el('button', '', 'Finish → script'); 
+  fin.onclick = async () => {
+    fin.disabled = true; more.disabled = true;
+    try { await fetch(base + '/api/script/log', {method: 'POST'}); } catch (e) {}
+    location.href = base + '/script';
+  };
+  row.appendChild(more); row.appendChild(fin); c.appendChild(row);
+  $('list').appendChild(c);
 }
 function renderAll(){
   $('all').replaceChildren();
@@ -664,7 +760,7 @@ function renderAll(){
       const res = await post(ok.map(i => payload(i, i.proposal.approve, i.proposal.handler)));
       const good = res.filter(r => r.status === 'ok' || r.status === 'already_decided').length;
       toast(good + ' saved' + (good < res.length ? ', ' + (res.length - good) + ' changed' : ''));
-      load();
+      showDone(good);
     } catch (e) { b.disabled = false; toast(e.message); }
   });
   $('all').appendChild(b);
@@ -702,9 +798,86 @@ async function load(){
     setSub(d);
     $('list').replaceChildren(...d.items.map(card));
     renderAll();
-    if (!d.items.length) afterChange();
+    if (!d.items.length) showDone(0);
   } catch (e) { banner('Could not load. Check your connection.', true); }
 }
 load();
 </script></body></html>
 """
+
+
+SCRIPT_PAGE_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Move script</title>
+<style>
+:root{--bg:#f6f6f4;--card:#fff;--ink:#1c1c1a;--mute:#6b6b66;--line:#e2e2dd;--acc:#2f4fd1;--ok:#1f7a4d;--code:#efefea}
+@media (prefers-color-scheme:dark){:root{--bg:#141413;--card:#1e1e1c;--ink:#ecece8;--mute:#9b9b94;--line:#33332f;--acc:#8ea2ff;--ok:#6fd0a0;--code:#2a2a27}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 -apple-system,system-ui,sans-serif;padding:16px max(16px,env(safe-area-inset-right)) 64px max(16px,env(safe-area-inset-left));max-width:760px}
+h1{font-size:20px;margin:4px 0 2px}
+.sub{color:var(--mute);font-size:14px;margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
+.card h2{font-size:16px;margin:0 0 6px}
+.meta{color:var(--mute);font-size:14px}
+pre,textarea{width:100%;background:var(--code);color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all;margin:8px 0}
+textarea{height:260px;white-space:pre;word-break:normal}
+button,a.btn{font:inherit;border:0;border-radius:12px;min-height:44px;padding:10px 14px;background:var(--acc);color:#fff;text-decoration:none;display:inline-block;cursor:pointer}
+button.alt{background:var(--line);color:var(--ink)}
+.ok{color:var(--ok)}
+a{color:var(--acc)}
+</style></head><body>
+<h1>Move script</h1>
+<div class="sub" id="sub">Loading…</div>
+<div id="steps"></div>
+<div class="card"><h2>The full script</h2>
+<div class="meta">Same text as the downloaded file and the latest entry in the “Script Log” tab of the sheet.</div>
+<textarea id="full" readonly></textarea>
+<button id="copyfull">Copy script</button></div>
+<p class="meta"><a id="back" href="#">← Back to decisions</a></p>
+<script>
+const base = location.pathname.replace(/\/script\/?$/, '');
+const $ = id => document.getElementById(id);
+function el(tag, cls, text){const e=document.createElement(tag); if(cls)e.className=cls; if(text!==undefined)e.textContent=text; return e;}
+async function copy(text, btn){
+  const old = btn.textContent;
+  try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
+  catch (e) { btn.textContent = 'Press and hold to copy'; }
+  setTimeout(() => btn.textContent = old, 1800);
+}
+function step(n, title, body, cmd){
+  const c = el('div','card'); c.appendChild(el('h2','', n + '. ' + title));
+  if (body) c.appendChild(el('div','meta', body));
+  if (cmd){
+    c.appendChild(el('pre','', cmd));
+    const b = el('button','alt','Copy command'); b.onclick = () => copy(cmd, b); c.appendChild(b);
+  }
+  $('steps').appendChild(c); return c;
+}
+$('back').href = base;
+(async () => {
+  try {
+    const r = await fetch(base + '/api/script'); const d = await r.json();
+    if (!r.ok) { $('sub').textContent = d.error || 'Could not load'; return; }
+    $('sub').textContent = d.moves + ' moves and ' + d.deletes + ' deletes approved. Deletes only go to a _to_delete folder.';
+    $('full').value = d.script;
+    $('copyfull').onclick = () => copy(d.script, $('copyfull'));
+    const url = location.origin + base + '/moves.ps1';
+    step(1, 'Open this page on your PC', 'The script runs on your Windows PC, not your phone. Open this same address there, or send yourself the link.',
+      location.href);
+    step(2, 'Open PowerShell', 'Press the Windows key, type PowerShell, press Enter.');
+    step(3, 'Download the script into Downloads', 'This fetches the current script from this page.',
+      'cd $env:USERPROFILE\\Downloads\nInvoke-WebRequest "' + url + '" -OutFile moves.ps1');
+    step(4, 'Preview — changes nothing', 'Lists every move and delete it would do. Check it against what you approved.',
+      '.\\moves.ps1');
+    step(5, 'Do it', 'Moves the files. Never overwrites, and skips anything missing. Writes a log and an undo script to Downloads\\_cleanup_logs.',
+      '.\\moves.ps1 -Apply');
+    step(6, 'If something looks wrong', 'Run the undo script it printed at the end, for example:',
+      '.\\_cleanup_logs\\undo-<time>.ps1');
+    step('+', 'If Windows blocks the script', 'Use this instead of steps 4 and 5 (add -Apply to the end for step 5).',
+      'powershell -ExecutionPolicy Bypass -File .\\moves.ps1');
+  } catch (e) { $('sub').textContent = 'Could not load. Check your connection.'; }
+})();
+</script></body></html>"""

@@ -96,6 +96,42 @@ class DecideTests(unittest.TestCase):
         self.assertNotIn("lease.pdf", r.text)  # undecided rows excluded
         self.assertIn("-Apply", r.text)
 
+    def _approve_first_move(self):
+        self.fake.tabs["Organize Proposal"][1][0:2] = ["Y", "Coach"]
+
+    def test_script_page_and_info(self):
+        self.assertEqual(self.client.get("/d/wrong/script").status_code, 404)
+        self.assertEqual(self.client.get("/d/wrong/api/script").status_code, 404)
+        self._approve_first_move()
+        page = self.client.get("/d/secret/script")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Copy script", page.text)
+        self.assertIn("-OutFile moves.ps1", page.text)
+        info = self.client.get("/d/secret/api/script").json()
+        self.assertEqual((info["moves"], info["deletes"]), (1, 0))
+        self.assertIn("a.jpg", info["script"])
+
+    def test_script_log_appends_once_and_creates_tab(self):
+        from unittest.mock import MagicMock
+        self._approve_first_move()
+        svc = MagicMock()
+        ss = svc.spreadsheets.return_value
+        ss.get.return_value.execute.return_value = {"sheets": [{"properties": {"title": "Captured"}}]}
+        ss.values.return_value.get.return_value.execute.return_value = {"values": [["Script"]]}
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            r = self.client.post("/d/secret/api/script/log")
+        self.assertEqual(r.json(), {"logged": True})
+        ss.batchUpdate.assert_called_once()  # tab created
+        row = ss.values.return_value.append.call_args.kwargs["body"]["values"][0]
+        self.assertEqual((row[1], row[2]), (1, 0))
+        self.assertIn("a.jpg", row[3])
+        # identical latest entry is not logged twice
+        ss.values.return_value.get.return_value.execute.return_value = {"values": [["Script"], [row[3]]]}
+        ss.get.return_value.execute.return_value = {"sheets": [{"properties": {"title": "Script Log"}}]}
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            r = self.client.post("/d/secret/api/script/log")
+        self.assertFalse(r.json()["logged"])
+
     def test_batch_includes_sheet_link(self):
         url = decide.get_batch()["sheet_url"]
         self.assertTrue(url.startswith("https://docs.google.com/spreadsheets/d/"))
