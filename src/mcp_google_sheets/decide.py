@@ -29,7 +29,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +242,33 @@ def _mix(items: List[Dict[str, Any]], n: int, cap: int) -> List[Dict[str, Any]]:
     return picked
 
 
+def _group(it: Dict[str, Any]) -> str:
+    return f"{it['tab']}|{it['category']}|{it['subfolder']}"
+
+
+def _focus_cleanup(items: List[Dict[str, Any]]) -> (List[Dict[str, Any]], str):
+    """Small-batch rule: cleanup cards in one batch all come from a single
+    category/subfolder, so a batch is one coherent question ("these 5
+    School - BME files") instead of a random slice of 188. Picks the group
+    with the most rows an Accept-all could clear, ties by sheet order."""
+    cleanup = [i for i in items if i["kind"] != "task"]
+    if not cleanup:
+        return items, ""
+    score: Dict[str, int] = {}
+    first: Dict[str, int] = {}
+    for pos, it in enumerate(cleanup):
+        g = _group(it)
+        first.setdefault(g, pos)
+        score[g] = score.get(g, 0) + (1 if it["proposal"] else 0)
+    focus = max(score, key=lambda g: (score[g], -first[g]))
+    keep = [i for i in items if i["kind"] == "task" or _group(i) == focus]
+    sample = next(i for i in cleanup if _group(i) == focus)
+    label = sample["category"] or "Delete candidates"
+    if sample["subfolder"]:
+        label += " / " + sample["subfolder"]
+    return keep, label
+
+
 def get_batch(n: int = BATCH_SIZE) -> Dict[str, Any]:
     items: List[Dict[str, Any]] = []
     for tab in TABS:
@@ -254,7 +281,9 @@ def get_batch(n: int = BATCH_SIZE) -> Dict[str, Any]:
     counts: Dict[str, int] = {}
     for it in items:
         counts[it["agent"]] = counts.get(it["agent"], 0) + 1
-    return {"items": _mix(items, n, _agent_cap()), "pending_total": len(items),
+    batch_items, focus = _focus_cleanup(items)
+    return {"items": _mix(batch_items, n, _agent_cap()), "pending_total": len(items),
+            "focus": focus,
             "agent_counts": counts, "write_enabled": _write_enabled(),
             "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit",
             "queue_url": f"https://docs.google.com/spreadsheets/d/{_queue_sheet_id()}/edit"}
@@ -305,6 +334,96 @@ def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return results
 
 
+# ------------------------------------------------------------ move script
+APPROVED_TABS = ("Organize Proposal", "Delete Candidates")
+
+
+def approved_actions() -> List[Dict[str, str]]:
+    """Rows recorded as Approve=Y and Handler=Coach, as move/delete actions."""
+    out: List[Dict[str, str]] = []
+    for tab in APPROVED_TABS:
+        values = _read_tab(tab)
+        header_row, kind = TABS[tab]
+        if len(values) < header_row:
+            continue
+        cols = _columns(values[header_row - 1])
+        ia, ih = cols.get(H_APPROVE), cols.get(H_HANDLER)
+        ip, idest = cols.get("current path"), cols.get("proposed new path")
+        if None in (ia, ih, ip):
+            continue
+        for row in values[header_row:]:
+            if _cell(row, ia) != "Y" or _cell(row, ih) != "Coach":
+                continue
+            src = _cell(row, ip)
+            dest = _cell(row, idest) if kind == "move" else ""
+            if kind == "move" and not dest:
+                continue
+            out.append({"kind": kind, "src": src, "dest": dest})
+    return out
+
+
+def _ps(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def build_script(actions: List[Dict[str, str]]) -> str:
+    """PowerShell that applies approved actions safely: dry run unless
+    -Apply, never overwrites, deletes only go to a _to_delete folder, and
+    every real move is logged with a ready-made undo script."""
+    lines = []
+    for a in actions:
+        parts = [a["src"], a["dest"]]
+        if any(p.startswith(("/", "\\")) or ".." in p.replace("\\", "/").split("/")
+               or ":" in p for p in parts if p):
+            continue  # refuse anything that could leave the Downloads tree
+        if not a["src"].startswith("Downloads/"):
+            continue
+        if a["kind"] == "move" and not a["dest"].startswith("Downloads/"):
+            continue
+        lines.append(f"    @{{ Kind={_ps(a['kind'])}; Src={_ps(a['src'])}; Dest={_ps(a['dest'])} }}")
+    body = ",\n".join(lines)
+    return f"""# Approved cleanup moves (generated from your Y + Coach rows).
+# Dry run by default: shows what WOULD happen and changes nothing.
+#   .\\moves.ps1            -> preview
+#   .\\moves.ps1 -Apply     -> do it (writes a log and undo script)
+param([string]$Root = $env:USERPROFILE, [switch]$Apply)
+$ErrorActionPreference = 'Stop'
+$actions = @(
+{body}
+)
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$logDir = Join-Path $Root 'Downloads\_cleanup_logs'
+$trash  = Join-Path $Root 'Downloads\_to_delete'
+$log = @(); $undo = @(); $moved = 0; $skipped = 0
+foreach ($a in $actions) {{
+    $src = Join-Path $Root ($a.Src -replace '/', '\\')
+    if ($a.Kind -eq 'delete') {{
+        $dst = Join-Path $trash (Split-Path $src -Leaf)
+    }} else {{
+        $dst = Join-Path $Root ($a.Dest -replace '/', '\\')
+    }}
+    if (-not (Test-Path -LiteralPath $src)) {{ Write-Host "SKIP (missing)  $src"; $skipped++; continue }}
+    if (Test-Path -LiteralPath $dst)        {{ Write-Host "SKIP (exists)   $dst"; $skipped++; continue }}
+    Write-Host ("{{0,-7}} {{1}}  ->  {{2}}" -f $a.Kind.ToUpper(), $src, $dst)
+    if ($Apply) {{
+        New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+        Move-Item -LiteralPath $src -Destination $dst
+        $log  += [pscustomobject]@{{ Kind=$a.Kind; From=$src; To=$dst }}
+        $undo += "Move-Item -LiteralPath '$($dst -replace "'","''")' -Destination '$($src -replace "'","''")'"
+        $moved++
+    }}
+}}
+if ($Apply -and $moved -gt 0) {{
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $log  | Export-Csv -NoTypeInformation (Join-Path $logDir "moves-$stamp.csv")
+    $undo | Set-Content (Join-Path $logDir "undo-$stamp.ps1")
+    Write-Host "Moved $moved. Skipped $skipped. Undo: $logDir\\undo-$stamp.ps1"
+}} elseif (-not $Apply) {{
+    Write-Host "Preview only. $($actions.Count) approved, $skipped would be skipped. Re-run with -Apply to do it."
+}}
+"""
+
+
 # --------------------------------------------------------------------- web
 _NO_CACHE = {
     "Cache-Control": "no-store",
@@ -345,6 +464,18 @@ async def _batch(request: Request):
     return JSONResponse(data, headers=_NO_CACHE)
 
 
+async def _script(request: Request):
+    if not _authorized(request):
+        return _deny()
+    try:
+        actions = await asyncio.to_thread(approved_actions)
+    except Exception as e:
+        logger.exception("decide: script failed")
+        return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
+    headers = {**_NO_CACHE, "Content-Disposition": 'attachment; filename="moves.ps1"'}
+    return PlainTextResponse(build_script(actions), headers=headers)
+
+
 async def _answer(request: Request):
     if not _authorized(request):
         return _deny()
@@ -381,6 +512,7 @@ def register(mcp) -> None:
     mcp.custom_route("/d/{token}", methods=["GET"])(_page)
     mcp.custom_route("/d/{token}/api/batch", methods=["GET"])(_batch)
     mcp.custom_route("/d/{token}/api/answer", methods=["POST"])(_answer)
+    mcp.custom_route("/d/{token}/moves.ps1", methods=["GET"])(_script)
     logger.info("decide: page enabled (write=%s)", _write_enabled())
 
 
