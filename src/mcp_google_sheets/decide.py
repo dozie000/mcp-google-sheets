@@ -471,7 +471,7 @@ NOTES_SOURCE = "apple-notes"
 _CHECK_RE = re.compile(r"^\s*(?:[-*+]\s*)?\[( |x|X)\]\s?(.*)$")
 
 
-_MARK_RE = re.compile(r"(?:^|(?<=\s))(?:[-*+\u2022]\s*)?(?:\[( |x|X)\]|(\u2610|\u25cb|\u25ef)|(\u2611|\u2705|\u2714))[ \t]?", re.M)
+_MARK_RE = re.compile(r"(?:^|(?<=\s))(?:[-*+\u2022]\s*)?(?:\[( |x|X)\]|([\u2610\u25cb\u25e6\u25ef\u25fb\u25a2\u2b1c])|([\u2611\u2705\u2713\u2714]))[ \t]?", re.M)
 
 
 def parse_checklist(text: str) -> List[str]:

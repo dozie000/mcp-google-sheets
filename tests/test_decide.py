@@ -387,3 +387,10 @@ def test_parse_checklist_tolerant():
     assert parse_checklist("☐ one\r\n☑ two\r\n○ three") == ["one", "three"]
     assert parse_checklist("Heading\n[ ]x\n") == ["x"]
     assert parse_checklist("no boxes here") == []
+
+
+def test_parse_checklist_notes_plaintext_glyphs():
+    from mcp_google_sheets.decide import parse_checklist
+    t = ("A bucket of stuff to address\n\t✓\tApply for a job\n"
+         "\t◦\tResearch distributed cognition\n\t✓\tCheck on enterprise job\n")
+    assert parse_checklist(t) == ["Research distributed cognition"]
