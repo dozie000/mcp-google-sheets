@@ -25,6 +25,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -349,6 +350,20 @@ def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             results.append({**rid, "status": "ok"})
         if updates:
             _write_cells(updates)
+        to_apply = []
+        for ans, res in zip(answers, results):
+            if res.get("status") != "ok" or ans.get("tab") != QUEUE_TAB or ans.get("approve") != "Y":
+                continue
+            values = by_tab[QUEUE_TAB]
+            cols = _columns(values[TABS[QUEUE_TAB][0] - 1])
+            cur = values[ans["row"] - 1]
+            ia, iap = cols.get("action"), cols.get("applied utc")
+            if ia is None or iap is None or not _cell(cur, ia) or _cell(cur, iap):
+                continue
+            to_apply.append({"row": ans["row"], "action": _cell(cur, ia),
+                             "handler": ans.get("handler", ""), "applied_col": iap})
+        if to_apply:
+            _apply_queue_actions(to_apply)
     return results
 
 
@@ -449,6 +464,151 @@ if ($Apply -and $moved -gt 0) {{
     Write-Host "Preview only. $($actions.Count) approved, $skipped would be skipped. Re-run with -Apply to do it."
 }}
 """
+
+
+PIPELINE_TABS = ("Captured", "Clarified", "Organized", "Refined", "Execute")
+NOTES_SOURCE = "apple-notes"
+_CHECK_RE = re.compile(r"^\s*(?:[-*+]\s*)?\[( |x|X)\]\s?(.*)$")
+
+
+def parse_checklist(text: str) -> List[str]:
+    """Unchecked items from a markdown-style checklist, in order, de-duplicated."""
+    seen, out = set(), []
+    for line in text.splitlines():
+        m = _CHECK_RE.match(line)
+        if not m or m.group(1) != " ":
+            continue
+        item = " ".join(m.group(2).split())
+        if item and item.lower() not in seen:
+            seen.add(item.lower())
+            out.append(item)
+    return out
+
+
+def _now_utc() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _now_local() -> str:
+    """Timestamp in the style the pipeline tabs already use (Eastern time)."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    t = _dt.datetime.now(ZoneInfo("America/New_York"))
+    return f"{t:%Y-%m-%d} {t.hour}:{t:%M}"
+
+
+def _next_id(rows: List[List[str]], prefix: str, col: int = 0) -> int:
+    top = 0
+    for r in rows[1:]:
+        m = re.match(rf"{prefix}-(\d+)$", _cell(r, col))
+        if m:
+            top = max(top, int(m.group(1)))
+    return top
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def ingest_notes(text: str) -> Dict[str, Any]:
+    """Add new unchecked checklist items to the pipeline's Captured tab. An
+    item whose text is already in Captured (whatever happened to it since) is
+    never added twice."""
+    items = parse_checklist(text)
+    svc = _sheets_service().spreadsheets()
+    sid = _queue_sheet_id()
+    with _write_lock:
+        rows = svc.values().get(
+            spreadsheetId=sid, range="'Captured'!A:Z").execute().get("values", [])
+        if not rows:
+            raise ValueError("Captured tab has no header row")
+        cols = _columns(rows[0])
+        ii, it_, ir = cols.get("id"), cols.get("timestamp"), cols.get("raw_text")
+        isrc = cols.get("source_type")
+        if None in (ii, it_, ir):
+            raise ValueError("Captured needs id, timestamp and raw_text columns")
+        known = {_norm(_cell(r, ir)) for r in rows[1:]}
+        top, now, new_rows = _next_id(rows, "c", ii), _now_local(), []
+        for item in items:
+            if _norm(item) in known:
+                continue
+            known.add(_norm(item))
+            top += 1
+            row = [""] * len(rows[0])
+            row[ii], row[it_], row[ir] = f"c-{top:04d}", now, item
+            if isrc is not None:
+                row[isrc] = NOTES_SOURCE
+            new_rows.append(row)
+        if new_rows:
+            svc.values().append(
+                spreadsheetId=sid, range="'Captured'!A:Z",
+                valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                body={"values": new_rows}).execute()
+    return {"unchecked_in_note": len(items), "added": len(new_rows),
+            "already_known": len(items) - len(new_rows)}
+
+
+def apply_action(action_text: str, handler: str) -> str:
+    """Carry out an approved coach proposal stored in the Task Queue's
+    'Action' column. Only one operation exists: append a row to the next
+    pipeline tab. Nothing is ever deleted, and an id already present in the
+    destination is left alone. Returns 'applied', 'exists' or 'invalid'."""
+    try:
+        act = json.loads(action_text)
+        dest, rid, row = act["to"], str(act["id"]).strip(), act["row"]
+        if (act.get("op") != "promote" or dest not in PIPELINE_TABS[1:]
+                or not rid or not isinstance(row, dict)
+                or act.get("from", "Captured") not in PIPELINE_TABS):
+            return "invalid"
+    except Exception:
+        return "invalid"
+    svc = _sheets_service().spreadsheets()
+    sid = _queue_sheet_id()
+    rows = svc.values().get(spreadsheetId=sid, range=f"'{dest}'!A:Z").execute().get("values", [])
+    if not rows:
+        return "invalid"
+    header = rows[0]
+    cols = _columns(header)
+    if "id" not in cols:
+        return "invalid"
+    if any(_cell(r, cols["id"]) == rid for r in rows[1:]):
+        return "exists"
+    given = {str(k).strip().lower(): str(v)[:2000] for k, v in row.items()}
+    given["id"] = rid
+    h = handler.lower() if handler in ("Me", "Coach") else ""
+    out = []
+    for name in header:
+        k = str(name).strip().lower()
+        if k == "handler":
+            out.append(given.get(k) or h)
+        elif k == "timestamp":
+            out.append(given.get(k) or _now_local())
+        elif k == "last_reviewed":
+            out.append(given.get(k) or _now_local().split(" ")[0])
+        else:
+            out.append(given.get(k, ""))
+    svc.values().append(spreadsheetId=sid, range=f"'{dest}'!A:Z",
+                        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                        body={"values": [out]}).execute()
+    return "applied"
+
+
+def _apply_queue_actions(approved: List[Dict[str, Any]]) -> None:
+    """approved: [{row, action, handler, applied_col}] for Task Queue rows that
+    were just answered Y and carry an Action. Stamps 'Applied UTC' on success."""
+    stamps = []
+    for a in approved:
+        try:
+            status = apply_action(a["action"], a["handler"])
+        except Exception:
+            logger.exception("decide: could not apply action for queue row %s", a["row"])
+            continue
+        if status in ("applied", "exists"):
+            stamps.append({"tab": QUEUE_TAB, "values": [[_now_utc()]],
+                           "range": f"'{QUEUE_TAB}'!{chr(ord('A') + a['applied_col'])}{a['row']}"})
+    if stamps:
+        _write_cells(stamps)
 
 
 SCRIPT_LOG_TAB = "Script Log"
@@ -578,6 +738,28 @@ async def _script_log(request: Request):
     return JSONResponse(res, headers=_NO_CACHE)
 
 
+async def _notes(request: Request):
+    if not _authorized(request):
+        return _deny()
+    if not _write_enabled():
+        return JSONResponse({"error": "read-only preview"}, status_code=403, headers=_NO_CACHE)
+    try:
+        text = (await request.body())[:300_000].decode("utf-8", "replace")
+        if "json" in request.headers.get("content-type", "") or text.lstrip().startswith("{"):
+            data = json.loads(text)
+            text = data.get("text") or data.get("body") or ""
+        if not isinstance(text, str):
+            raise ValueError
+    except Exception:
+        return JSONResponse({"error": "bad request"}, status_code=400, headers=_NO_CACHE)
+    try:
+        res = await asyncio.to_thread(ingest_notes, text)
+    except Exception as e:
+        logger.exception("decide: notes ingest failed")
+        return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
+    return JSONResponse(res, headers=_NO_CACHE)
+
+
 async def _answer(request: Request):
     if not _authorized(request):
         return _deny()
@@ -616,6 +798,7 @@ def register(mcp) -> None:
     mcp.custom_route("/d/{token}/api/answer", methods=["POST"])(_answer)
     mcp.custom_route("/d/{token}/moves.ps1", methods=["GET"])(_script)
     mcp.custom_route("/d/{token}/script", methods=["GET"])(_script_page)
+    mcp.custom_route("/d/{token}/api/notes", methods=["POST"])(_notes)
     mcp.custom_route("/d/{token}/api/script", methods=["GET"])(_script_info)
     mcp.custom_route("/d/{token}/api/script/log", methods=["POST"])(_script_log)
     logger.info("decide: page enabled (write=%s)", _write_enabled())
