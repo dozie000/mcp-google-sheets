@@ -367,3 +367,13 @@ def test_focus_cleanup_picks_one_group():
     kept, label = decide._focus_cleanup(items)
     assert label == "Images / Photos"
     assert task in kept and len(kept) == 3
+
+
+def test_eastern_without_tzdb():
+    import datetime as dt
+    from mcp_google_sheets.decide import _eastern
+    u = dt.timezone.utc
+    assert _eastern(dt.datetime(2026, 10, 12, 21, 52, tzinfo=u)).hour == 17
+    assert _eastern(dt.datetime(2026, 12, 1, 12, 0, tzinfo=u)).hour == 7
+    assert _eastern(dt.datetime(2026, 3, 8, 6, 59, tzinfo=u)).hour == 1
+    assert _eastern(dt.datetime(2026, 3, 8, 7, 0, tzinfo=u)).hour == 3

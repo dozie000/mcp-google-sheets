@@ -490,11 +490,26 @@ def _now_utc() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _eastern(utc):
+    """US Eastern wall time from an aware-UTC datetime, without a tz database
+    (the container image has none). DST: 2nd Sunday of March to 1st of Nov, 2am."""
+    import datetime as _dt
+
+    def nth_sunday(year, month, n):
+        d = _dt.date(year, month, 1)
+        d += _dt.timedelta(days=(6 - d.weekday()) % 7 + 7 * (n - 1))
+        return d
+    y = utc.year
+    start = _dt.datetime.combine(nth_sunday(y, 3, 2), _dt.time(7), tzinfo=_dt.timezone.utc)
+    end = _dt.datetime.combine(nth_sunday(y, 11, 1), _dt.time(6), tzinfo=_dt.timezone.utc)
+    off = -4 if start <= utc < end else -5
+    return utc + _dt.timedelta(hours=off)
+
+
 def _now_local() -> str:
     """Timestamp in the style the pipeline tabs already use (Eastern time)."""
     import datetime as _dt
-    from zoneinfo import ZoneInfo
-    t = _dt.datetime.now(ZoneInfo("America/New_York"))
+    t = _eastern(_dt.datetime.now(_dt.timezone.utc))
     return f"{t:%Y-%m-%d} {t.hour}:{t:%M}"
 
 
