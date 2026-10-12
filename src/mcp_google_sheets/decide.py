@@ -21,7 +21,6 @@ Environment:
 
 import asyncio
 import base64
-import hashlib
 import hmac
 import json
 import logging
@@ -41,20 +40,13 @@ BATCH_SIZE = 15
 DEFAULT_QUEUE_SHEET_ID = "18DX6GMnxn2hadduPZevCv36Ecu6y76OzzojwRmZjhCU"
 AGENT_CAP = 5
 QUEUE_TAB = "Task Queue"
-NOTES_TAB = "Notes Inbox"
 
 # tab name -> (1-based header row, kind of action)
 TABS = {
     "Organize Proposal": (1, "move"),
     "Delete Candidates": (2, "delete"),
     QUEUE_TAB: (1, "task"),
-    NOTES_TAB: (1, "note"),
 }
-NOTES_AGENT = "Apple Notes"
-NOTES_BATCH = 5
-NOTES_HEADER = ["id", "agent", "title", "detail", "Proposed Handler", "Needs You",
-                "Approve? (Y/N)", "Handler (Me/Coach)", "Link", "Created UTC",
-                "Applied UTC", "key"]
 CLEANUP_AGENT = "Folder CleanUp"
 
 H_APPROVE = "approve? (y/n)"
@@ -88,7 +80,7 @@ def _agent_cap() -> int:
 
 
 def _sheet_for(tab: str) -> str:
-    return _queue_sheet_id() if tab in (QUEUE_TAB, NOTES_TAB) else _sheet_id()
+    return _queue_sheet_id() if tab == QUEUE_TAB else _sheet_id()
 
 
 def _write_enabled() -> bool:
@@ -170,7 +162,7 @@ def parse_tab(tab: str, values: List[List[str]]) -> List[Dict[str, Any]]:
     ia, ih = cols.get(H_APPROVE), cols.get(H_HANDLER)
     if ia is None or ih is None:
         raise ValueError(f"'{tab}' is missing the Approve?/Handler columns")
-    ip = cols.get("id" if kind in ("task", "note") else "current path")
+    ip = cols.get("id" if kind == "task" else "current path")
     icat, isub = cols.get("category"), cols.get("subfolder")
     idest, isize = cols.get("proposed new path"), cols.get("size")
     imod, inote = cols.get("modified"), cols.get("notes")
@@ -187,15 +179,14 @@ def parse_tab(tab: str, values: List[List[str]]) -> List[Dict[str, Any]]:
         approve, handler = _cell(row, ia), _cell(row, ih)
         if approve and handler:
             continue  # fully decided
-        if kind in ("task", "note"):
+        if kind == "task":
             title = _cell(row, ititle) or path
             reason = "Needs your judgment" if _cell(row, ineeds).lower() in (
                 "y", "yes", "true", "1") else ""
             hint = _cell(row, ipro)
             item = {
                 "tab": tab, "row": idx + 1, "kind": kind, "path": path,
-                "name": title,
-                "agent": _cell(row, iagent) or (NOTES_AGENT if kind == "note" else "Agent"),
+                "name": title, "agent": _cell(row, iagent) or "Agent",
                 "category": "", "subfolder": "", "dest": "", "size": "",
                 "modified": "", "notes": _cell(row, idetail),
                 "link": _safe_link(_cell(row, ilink)),
@@ -261,7 +252,7 @@ def _focus_cleanup(items: List[Dict[str, Any]]) -> (List[Dict[str, Any]], str):
     category/subfolder, so a batch is one coherent question ("these 5
     School - BME files") instead of a random slice of 188. Picks the group
     with the most rows an Accept-all could clear, ties by sheet order."""
-    cleanup = [i for i in items if i["kind"] in ("move", "delete")]
+    cleanup = [i for i in items if i["kind"] != "task"]
     if not cleanup:
         return items, ""
     score: Dict[str, int] = {}
@@ -271,7 +262,7 @@ def _focus_cleanup(items: List[Dict[str, Any]]) -> (List[Dict[str, Any]], str):
         first.setdefault(g, pos)
         score[g] = score.get(g, 0) + (1 if it["proposal"] else 0)
     focus = max(score, key=lambda g: (score[g], -first[g]))
-    keep = [i for i in items if i["kind"] not in ("move", "delete") or _group(i) == focus]
+    keep = [i for i in items if i["kind"] == "task" or _group(i) == focus]
     sample = next(i for i in cleanup if _group(i) == focus)
     label = sample["category"] or "Delete candidates"
     if sample["subfolder"]:
@@ -291,7 +282,7 @@ def get_batch(n: int = BATCH_SIZE, view: str = "queue") -> Dict[str, Any]:
             raw[tab] = values
             items.extend(parse_tab(tab, values))
         except Exception:
-            if tab not in (QUEUE_TAB, NOTES_TAB):
+            if tab != QUEUE_TAB:
                 raise
             logger.warning("decide: Task Queue tab unavailable; skipping", exc_info=True)
     counts: Dict[str, int] = {}
@@ -302,26 +293,18 @@ def get_batch(n: int = BATCH_SIZE, view: str = "queue") -> Dict[str, Any]:
         "write_enabled": _write_enabled(), "focus": "",
         "sheet_url": f"https://docs.google.com/spreadsheets/d/{_sheet_id()}/edit",
         "queue_url": f"https://docs.google.com/spreadsheets/d/{_queue_sheet_id()}/edit"}
-    cleanup = [i for i in items if i["kind"] in ("move", "delete")]
+    cleanup = [i for i in items if i["kind"] != "task"]
     tasks = [i for i in items if i["kind"] == "task"]
-    notes = [i for i in items if i["kind"] == "note"]
-    if view == "notes":
-        out["items"] = notes[:min(n, NOTES_BATCH)]
-        out["focus"] = NOTES_AGENT
-        out["notes_left"] = len(notes)
-        return out
     if view == "cleanup":
         batch_items, out["focus"] = _focus_cleanup(cleanup)
         out["items"] = _mix(batch_items, n, _agent_cap())
         return out
     out["items"] = _mix(tasks, n, _agent_cap())
     ready = len(approved_actions(raw)) if all(t in raw for t in APPROVED_TABS) else 0
-    out["groups"] = ([{
-        "agent": CLEANUP_AGENT, "view": "cleanup", "pending": len(cleanup),
-        "approved": ready, "your_call": sum(1 for i in cleanup if i["manual_reason"]),
-    }] if (cleanup or ready) else []) + ([{
-        "agent": NOTES_AGENT, "view": "notes", "pending": len(notes),
-    }] if notes else [])
+    out["groups"] = [{
+        "agent": CLEANUP_AGENT, "pending": len(cleanup), "approved": ready,
+        "your_call": sum(1 for i in cleanup if i["manual_reason"]),
+    }] if (cleanup or ready) else []
     return out
 
 
@@ -348,7 +331,7 @@ def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             values = by_tab[tab]
             cols = _columns(values[TABS[tab][0] - 1])
             cur = values[row - 1] if row - 1 < len(values) else []
-            idcol = "id" if TABS[tab][1] in ("task", "note") else "current path"
+            idcol = "id" if TABS[tab][1] == "task" else "current path"
             if _cell(cur, cols.get(idcol)) != ans.get("path"):
                 results.append({**rid, "status": "stale"})
                 continue
@@ -367,19 +350,20 @@ def apply_answers(answers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             results.append({**rid, "status": "ok"})
         if updates:
             _write_cells(updates)
-        promote = []
+        to_apply = []
         for ans, res in zip(answers, results):
-            if (res.get("status") == "ok" and ans.get("tab") == NOTES_TAB
-                    and ans.get("approve") == "Y"):
-                cur = by_tab[NOTES_TAB][ans["row"] - 1]
-                cols = _columns(by_tab[NOTES_TAB][TABS[NOTES_TAB][0] - 1])
-                promote.append({"row": ans["row"], "title": _cell(cur, cols.get("title"))
-                                or ans.get("path", "")})
-        if promote:
-            try:
-                _promote_notes(promote)
-            except Exception:
-                logger.exception("decide: could not copy approved notes to Captured")
+            if res.get("status") != "ok" or ans.get("tab") != QUEUE_TAB or ans.get("approve") != "Y":
+                continue
+            values = by_tab[QUEUE_TAB]
+            cols = _columns(values[TABS[QUEUE_TAB][0] - 1])
+            cur = values[ans["row"] - 1]
+            ia, iap = cols.get("action"), cols.get("applied utc")
+            if ia is None or iap is None or not _cell(cur, ia) or _cell(cur, iap):
+                continue
+            to_apply.append({"row": ans["row"], "action": _cell(cur, ia),
+                             "handler": ans.get("handler", ""), "applied_col": iap})
+        if to_apply:
+            _apply_queue_actions(to_apply)
     return results
 
 
@@ -482,8 +466,9 @@ if ($Apply -and $moved -gt 0) {{
 """
 
 
+PIPELINE_TABS = ("Captured", "Clarified", "Organized", "Refined", "Execute")
+NOTES_SOURCE = "apple-notes"
 _CHECK_RE = re.compile(r"^\s*(?:[-*+]\s*)?\[( |x|X)\]\s?(.*)$")
-_URL_RE = re.compile(r"https://[^\s<>\"')]+")
 
 
 def parse_checklist(text: str) -> List[str]:
@@ -494,15 +479,10 @@ def parse_checklist(text: str) -> List[str]:
         if not m or m.group(1) != " ":
             continue
         item = " ".join(m.group(2).split())
-        key = item.lower()
-        if item and key not in seen:
-            seen.add(key)
+        if item and item.lower() not in seen:
+            seen.add(item.lower())
             out.append(item)
     return out
-
-
-def _note_key(item: str) -> str:
-    return hashlib.sha1(" ".join(item.lower().split()).encode()).hexdigest()[:12]
 
 
 def _now_utc() -> str:
@@ -510,73 +490,125 @@ def _now_utc() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _now_local() -> str:
+    """Timestamp in the style the pipeline tabs already use (Eastern time)."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    t = _dt.datetime.now(ZoneInfo("America/New_York"))
+    return f"{t:%Y-%m-%d} {t.hour}:{t:%M}"
+
+
+def _next_id(rows: List[List[str]], prefix: str, col: int = 0) -> int:
+    top = 0
+    for r in rows[1:]:
+        m = re.match(rf"{prefix}-(\d+)$", _cell(r, col))
+        if m:
+            top = max(top, int(m.group(1)))
+    return top
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
 def ingest_notes(text: str) -> Dict[str, Any]:
-    """Add new unchecked checklist items to the 'Notes Inbox' tab. Items seen
-    before (by normalized text) are never added twice, whatever happened to
-    them since."""
+    """Add new unchecked checklist items to the pipeline's Captured tab. An
+    item whose text is already in Captured (whatever happened to it since) is
+    never added twice."""
     items = parse_checklist(text)
     svc = _sheets_service().spreadsheets()
     sid = _queue_sheet_id()
     with _write_lock:
-        meta = svc.get(spreadsheetId=sid, fields="sheets.properties.title").execute()
-        titles = {x["properties"]["title"] for x in meta.get("sheets", [])}
-        if NOTES_TAB not in titles:
-            svc.batchUpdate(spreadsheetId=sid, body={"requests": [
-                {"addSheet": {"properties": {"title": NOTES_TAB}}}]}).execute()
-            svc.values().update(
-                spreadsheetId=sid, range=f"'{NOTES_TAB}'!A1:L1",
-                valueInputOption="RAW", body={"values": [NOTES_HEADER]}).execute()
         rows = svc.values().get(
-            spreadsheetId=sid, range=f"'{NOTES_TAB}'!A:L").execute().get("values", [])
-        known = {_cell(r, 11) for r in rows[1:]}
-        top = 0
-        for r in rows[1:]:
-            m = re.match(r"n-(\d+)$", _cell(r, 0))
-            if m:
-                top = max(top, int(m.group(1)))
-        now, new_rows = _now_utc(), []
+            spreadsheetId=sid, range="'Captured'!A:Z").execute().get("values", [])
+        if not rows:
+            raise ValueError("Captured tab has no header row")
+        cols = _columns(rows[0])
+        ii, it_, ir = cols.get("id"), cols.get("timestamp"), cols.get("raw_text")
+        isrc = cols.get("source_type")
+        if None in (ii, it_, ir):
+            raise ValueError("Captured needs id, timestamp and raw_text columns")
+        known = {_norm(_cell(r, ir)) for r in rows[1:]}
+        top, now, new_rows = _next_id(rows, "c", ii), _now_local(), []
         for item in items:
-            k = _note_key(item)
-            if k in known:
+            if _norm(item) in known:
                 continue
-            known.add(k)
+            known.add(_norm(item))
             top += 1
-            url = _URL_RE.search(item)
-            new_rows.append([f"n-{top:04d}", NOTES_AGENT, item,
-                             "Unchecked in your Apple Notes to-do list", "", "", "", "",
-                             url.group(0) if url else "", now, "", k])
+            row = [""] * len(rows[0])
+            row[ii], row[it_], row[ir] = f"c-{top:04d}", now, item
+            if isrc is not None:
+                row[isrc] = NOTES_SOURCE
+            new_rows.append(row)
         if new_rows:
             svc.values().append(
-                spreadsheetId=sid, range=f"'{NOTES_TAB}'!A:L",
+                spreadsheetId=sid, range="'Captured'!A:Z",
                 valueInputOption="RAW", insertDataOption="INSERT_ROWS",
                 body={"values": new_rows}).execute()
     return {"unchecked_in_note": len(items), "added": len(new_rows),
             "already_known": len(items) - len(new_rows)}
 
 
-def _promote_notes(approved: List[Dict[str, Any]]) -> None:
-    """Notes answered Y become new rows in the pipeline's Captured tab (so the
-    Capture Sweep clarifies them), and the Notes Inbox row is stamped Applied."""
-    if not approved:
-        return
+def apply_action(action_text: str, handler: str) -> str:
+    """Carry out an approved coach proposal stored in the Task Queue's
+    'Action' column. Only one operation exists: append a row to the next
+    pipeline tab. Nothing is ever deleted, and an id already present in the
+    destination is left alone. Returns 'applied', 'exists' or 'invalid'."""
+    try:
+        act = json.loads(action_text)
+        dest, rid, row = act["to"], str(act["id"]).strip(), act["row"]
+        if (act.get("op") != "promote" or dest not in PIPELINE_TABS[1:]
+                or not rid or not isinstance(row, dict)
+                or act.get("from", "Captured") not in PIPELINE_TABS):
+            return "invalid"
+    except Exception:
+        return "invalid"
     svc = _sheets_service().spreadsheets()
     sid = _queue_sheet_id()
-    cap = svc.values().get(spreadsheetId=sid, range="'Captured'!A:C").execute().get("values", [])
-    top = 0
-    for r in cap[1:]:
-        m = re.match(r"c-(\d+)$", _cell(r, 0))
-        if m:
-            top = max(top, int(m.group(1)))
-    now, rows, stamps = _now_utc(), [], []
-    for a in approved:
-        top += 1
-        rows.append([f"c-{top:04d}", now, a["title"]])
-        stamps.append({"range": f"'{NOTES_TAB}'!K{a['row']}", "values": [[now]]})
-    svc.values().append(spreadsheetId=sid, range="'Captured'!A:C",
+    rows = svc.values().get(spreadsheetId=sid, range=f"'{dest}'!A:Z").execute().get("values", [])
+    if not rows:
+        return "invalid"
+    header = rows[0]
+    cols = _columns(header)
+    if "id" not in cols:
+        return "invalid"
+    if any(_cell(r, cols["id"]) == rid for r in rows[1:]):
+        return "exists"
+    given = {str(k).strip().lower(): str(v)[:2000] for k, v in row.items()}
+    given["id"] = rid
+    h = handler.lower() if handler in ("Me", "Coach") else ""
+    out = []
+    for name in header:
+        k = str(name).strip().lower()
+        if k == "handler":
+            out.append(given.get(k) or h)
+        elif k == "timestamp":
+            out.append(given.get(k) or _now_local())
+        elif k == "last_reviewed":
+            out.append(given.get(k) or _now_local().split(" ")[0])
+        else:
+            out.append(given.get(k, ""))
+    svc.values().append(spreadsheetId=sid, range=f"'{dest}'!A:Z",
                         valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-                        body={"values": rows}).execute()
-    svc.values().batchUpdate(spreadsheetId=sid, body={
-        "valueInputOption": "RAW", "data": stamps}).execute()
+                        body={"values": [out]}).execute()
+    return "applied"
+
+
+def _apply_queue_actions(approved: List[Dict[str, Any]]) -> None:
+    """approved: [{row, action, handler, applied_col}] for Task Queue rows that
+    were just answered Y and carry an Action. Stamps 'Applied UTC' on success."""
+    stamps = []
+    for a in approved:
+        try:
+            status = apply_action(a["action"], a["handler"])
+        except Exception:
+            logger.exception("decide: could not apply action for queue row %s", a["row"])
+            continue
+        if status in ("applied", "exists"):
+            stamps.append({"tab": QUEUE_TAB, "values": [[_now_utc()]],
+                           "range": f"'{QUEUE_TAB}'!{chr(ord('A') + a['applied_col'])}{a['row']}"})
+    if stamps:
+        _write_cells(stamps)
 
 
 SCRIPT_LOG_TAB = "Script Log"
@@ -655,8 +687,7 @@ async def _batch(request: Request):
     except ValueError:
         n = BATCH_SIZE
     n = max(1, min(n, 50))
-    view = request.query_params.get("view")
-    view = view if view in ("cleanup", "notes") else "queue"
+    view = "cleanup" if request.query_params.get("view") == "cleanup" else "queue"
     try:
         data = await asyncio.to_thread(get_batch, n, view)
     except Exception as e:  # surface a readable cause on the page
@@ -713,8 +744,7 @@ async def _notes(request: Request):
     if not _write_enabled():
         return JSONResponse({"error": "read-only preview"}, status_code=403, headers=_NO_CACHE)
     try:
-        raw = (await request.body())[:300_000]
-        text = raw.decode("utf-8", "replace")
+        text = (await request.body())[:300_000].decode("utf-8", "replace")
         if "json" in request.headers.get("content-type", "") or text.lstrip().startswith("{"):
             data = json.loads(text)
             text = data.get("text") or data.get("body") or ""
@@ -865,19 +895,19 @@ async function decide(it, card, approve, handler){
     toast(e.message);
   }
 }
-function skip(it, card){ card.remove(); state.items = state.items.filter(x => x !== it); renderList(); }
+function skip(it, card){ card.remove(); state.items = state.items.filter(x => x !== it); afterChange(); }
 
 function card(it){
   const c = el('div', 'card');
   c.appendChild(el('div', 'name', it.name));
   c.insertBefore(el('div', 'agent', it.agent || 'Agent'), c.firstChild);
-  if (it.kind !== 'task' && it.kind !== 'note') {
+  if (it.kind !== 'task') {
     const where = it.kind === 'delete' ? 'Delete' : '→ ' + (it.dest || it.category);
     c.appendChild(el('div', 'meta', where));
     c.appendChild(el('div', 'meta', [it.size, it.modified].filter(Boolean).join(' · ')));
   }
   c.appendChild(el('span', 'tag' + (it.kind === 'delete' ? ' del' : ''),
-    it.kind === 'delete' ? 'Delete' : (it.kind === 'task' ? 'Task' : (it.kind === 'note' ? 'To-do' : 'Move'))));
+    it.kind === 'delete' ? 'Delete' : (it.kind === 'task' ? 'Task' : 'Move')));
   if (it.manual_reason) c.appendChild(el('span', 'tag warn', it.manual_reason + ' — your call'));
   if (it.notes) c.appendChild(el('div', 'meta', it.notes));
   if (it.link && /^https:\/\//.test(it.link)) {
@@ -892,16 +922,10 @@ function card(it){
     b.addEventListener('click', () => decide(it, c, a, h));
     row.appendChild(b);
   };
-  if (it.kind === 'note') {
-    mk('I’ll do it', 'yes', 'Y', 'Me');
-    mk('Coach does it', 'yes', 'Y', 'Coach');
-    mk('Drop it', 'rej', 'N', 'n/a');
-  } else {
-    const verb = it.kind === 'delete' ? 'Delete' : 'Approve';
-    mk(verb + ' · Coach', 'yes', 'Y', 'Coach');
-    mk(verb + ' · Me', 'yes', 'Y', 'Me');
-    mk('Reject', 'rej', 'N', 'n/a');
-  }
+  const verb = it.kind === 'delete' ? 'Delete' : 'Approve';
+  mk(verb + ' · Coach', 'yes', 'Y', 'Coach');
+  mk(verb + ' · Me', 'yes', 'Y', 'Me');
+  mk('Reject', 'rej', 'N', 'n/a');
   const s = el('button', '', 'Skip'); s.addEventListener('click', () => skip(it, c)); row.appendChild(s);
   c.appendChild(row);
   return c;
@@ -924,27 +948,22 @@ function setSnooze(agent, on){
 }
 function clearSnoozes(){ try { localStorage.removeItem('snooze'); } catch (e) {} }
 
-function afterChange(){ if (mode === 'notes' && !state.items.length) load(); else renderList(); }
+function afterChange(){ renderList(); }
 
 function groupCard(g){
   const c = el('div', 'card');
   c.appendChild(el('div', 'agent', g.agent));
-  if (g.view === 'notes') {
-    c.appendChild(el('div', 'name', g.pending + ' new to-dos from your notes'));
-    c.appendChild(el('div', 'meta', 'Unchecked items from your Apple Notes list. Opens a few at a time.'));
-  } else {
-    c.appendChild(el('div', 'name', g.pending
-      ? g.pending + ' files need a decision'
-      : 'All decided — ready for the move script'));
-    const bits = [];
-    if (g.approved) bits.push(g.approved + ' approved so far');
-    if (g.your_call) bits.push(g.your_call + ' need your call');
-    if (bits.length) c.appendChild(el('div', 'meta', bits.join(' · ')));
-    c.appendChild(el('div', 'meta', 'Opens a short run: a few files at a time, then the script.'));
-  }
+  c.appendChild(el('div', 'name', g.pending
+    ? g.pending + ' files need a decision'
+    : 'All decided — ready for the move script'));
+  const bits = [];
+  if (g.approved) bits.push(g.approved + ' approved so far');
+  if (g.your_call) bits.push(g.your_call + ' need your call');
+  if (bits.length) c.appendChild(el('div', 'meta', bits.join(' · ')));
+  c.appendChild(el('div', 'meta', 'Opens a short run: a few files at a time, then the script.'));
   const row = el('div', 'row');
   const open = el('button', 'yes', 'Open');
-  open.onclick = () => { mode = g.view || 'cleanup'; load(); };
+  open.onclick = () => { mode = 'cleanup'; load(); };
   const later = el('button', '', 'Not now');
   later.onclick = () => { setSnooze(g.agent, true); renderList(); };
   row.appendChild(open); row.appendChild(later); c.appendChild(row);
@@ -961,18 +980,6 @@ function backBar(){
 function renderList(){
   const list = $('list');
   list.replaceChildren();
-  if (mode === 'notes') {
-    list.appendChild(backBar());
-    if (!state.items.length) {
-      const c = el('div', 'card');
-      c.appendChild(el('div', 'name', 'All caught up'));
-      c.appendChild(el('div', 'meta', 'No new to-dos waiting from Apple Notes.'));
-      list.appendChild(c); return;
-    }
-    list.appendChild(el('div', 'banner', 'Apple Notes · ' + state.items.length + ' on this page'));
-    state.items.forEach(it => list.appendChild(card(it)));
-    return;
-  }
   if (mode === 'cleanup') {
     list.appendChild(backBar());
     if (!state.items.length) { showDone(0); return; }
@@ -1065,7 +1072,7 @@ async function load(){
     const r = await fetch(base + '/api/batch?view=' + mode);
     const d = await r.json();
     if (!r.ok) { banner(d.error, true); $('sub').textContent = ''; return; }
-    state = {items: d.items, groups: d.groups || [], focus: d.focus || '', notesLeft: d.notes_left || 0,
+    state = {items: d.items, groups: d.groups || [], focus: d.focus || '',
              write: d.write_enabled, sheetUrl: d.sheet_url};
     banner(d.write_enabled ? '' : 'Read-only preview — buttons are off.', false);
     setSub(d);

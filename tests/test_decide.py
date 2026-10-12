@@ -23,20 +23,13 @@ DELETE = [
 ]
 QUEUE = [
     ["id", "agent", "title", "detail", "Proposed Handler", "Needs You",
-     "Approve? (Y/N)", "Handler (Me/Coach)", "Link", "Created UTC"],
+     "Approve? (Y/N)", "Handler (Me/Coach)", "Link", "Created UTC", "Applied UTC", "Action"],
     ["t-1", "Capture Sweep", "Call the dentist", "from c-0004", "Me", "", "", "", "", ""],
     ["t-2", "Weekly Routine", "Archive Q3 notes", "", "Coach", "", "", "", "https://example.com/x", ""],
     ["t-3", "Weekly Routine", "Pick the 7 for next week", "", "", "Y", "", "", "javascript:alert(1)", ""],
     ["t-4", "Capture Sweep", "Already done", "", "Coach", "", "Y", "Coach", "", ""],
-]
-
-
-NOTES = [
-    ["id", "agent", "title", "detail", "Proposed Handler", "Needs You",
-     "Approve? (Y/N)", "Handler (Me/Coach)", "Link", "Created UTC", "Applied UTC", "key"],
-    ["n-0001", "Apple Notes", "Reach out to Entegee", "", "", "", "", "", "", "", "", "k1"],
-    ["n-0002", "Apple Notes", "Do taxes", "", "", "", "", "", "", "", "", "k2"],
-    ["n-0003", "Apple Notes", "Already answered", "", "", "", "N", "n/a", "", "", "", "k3"],
+    ["t-5", "Pipeline Coach", "Clarify: Reach out to Entegee?", "detail", "Me", "", "", "", "", "", "",
+     '{"op":"promote","from":"Captured","to":"Clarified","id":"c-0003","row":{"title":"Reach out to Entegee","outcome":"Intro call booked","next_action":"Email recruiter","readiness":"ready","source":"apple-notes","moved_from":"c-0003"}}'],
 ]
 
 
@@ -44,8 +37,7 @@ class Fake:
     def __init__(self):
         self.tabs = {"Organize Proposal": [list(r) for r in MOVE],
                      "Delete Candidates": [list(r) for r in DELETE],
-                     "Task Queue": [list(r) for r in QUEUE],
-                     "Notes Inbox": [list(r) for r in NOTES]}
+                     "Task Queue": [list(r) for r in QUEUE]}
         self.writes = []
 
     def read(self, tab):
@@ -80,7 +72,8 @@ class DecideTests(unittest.TestCase):
         q = decide.get_batch()
         self.assertTrue(all(i["kind"] == "task" for i in q["items"]))
         self.assertIn("Call the dentist", [i["name"] for i in q["items"]])
-        self.assertEqual([g["agent"] for g in q["groups"]], ["Folder CleanUp", "Apple Notes"])
+        self.assertEqual(len(q["groups"]), 1)
+        self.assertEqual(q["groups"][0]["agent"], "Folder CleanUp")
         self.assertEqual(q["groups"][0]["pending"], 5)
         self.assertEqual(q["groups"][0]["your_call"], 2)  # lease (Legal) and dup
         # cleanup view: small-batch rule, one category/subfolder
@@ -89,7 +82,7 @@ class DecideTests(unittest.TestCase):
         self.assertTrue(cleanup and all(i["kind"] != "task" for i in cleanup))
         self.assertEqual(len({(i["tab"], i["category"], i["subfolder"]) for i in cleanup}), 1)
         self.assertEqual(d["focus"].split(" / ")[0], cleanup[0]["category"])
-        self.assertEqual(d["pending_total"], 10)
+        self.assertEqual(d["pending_total"], 9)
         # every pending cleanup row is still reachable via the focus rotation
         seen = set()
         for it in decide.parse_tab("Organize Proposal", self.fake.tabs["Organize Proposal"]) + \
@@ -156,40 +149,12 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(c["view"], "cleanup")
         self.assertTrue(c["focus"])
 
-    def test_notes_are_one_group_in_the_queue_and_cards_in_their_view(self):
-        q = decide.get_batch()
-        self.assertTrue(all(i["kind"] == "task" for i in q["items"]))
-        g = {g["agent"]: g for g in q["groups"]}
-        self.assertEqual((g["Apple Notes"]["view"], g["Apple Notes"]["pending"]), ("notes", 2))
-        self.assertEqual(g["Folder CleanUp"]["view"], "cleanup")
-        n = decide.get_batch(view="notes")
-        self.assertEqual([i["name"] for i in n["items"]], ["Reach out to Entegee", "Do taxes"])
-        self.assertTrue(all(i["kind"] == "note" for i in n["items"]))
-        c = decide.get_batch(view="cleanup")
-        self.assertTrue(all(i["kind"] in ("move", "delete") for i in c["items"]))
-
-    def test_note_answer_yes_copies_to_captured(self):
+    def _svc(self, tab_rows):
         from unittest.mock import MagicMock
         svc = MagicMock()
         ss = svc.spreadsheets.return_value
-        ss.values.return_value.get.return_value.execute.return_value = {
-            "values": [["id", "timestamp", "raw_text"], ["c-0007", "t", "x"]]}
-        it = [i for i in decide.get_batch(view="notes")["items"] if i["path"] == "n-0001"][0]
-        with patch.object(decide, "_sheets_service", return_value=svc):
-            res = decide.apply_answers([{"tab": "Notes Inbox", "row": it["row"], "path": "n-0001",
-                                         "approve": "Y", "handler": "Me"}])
-        self.assertEqual(res[0]["status"], "ok")
-        self.assertEqual(self.fake.writes[-1]["range"], "'Notes Inbox'!G2:H2")
-        row = ss.values.return_value.append.call_args.kwargs["body"]["values"][0]
-        self.assertEqual((row[0], row[2]), ("c-0008", "Reach out to Entegee"))
-
-    def test_note_answer_no_does_not_touch_captured(self):
-        from unittest.mock import MagicMock
-        svc = MagicMock()
-        with patch.object(decide, "_sheets_service", return_value=svc):
-            decide.apply_answers([{"tab": "Notes Inbox", "row": 3, "path": "n-0002",
-                                   "approve": "N", "handler": "n/a"}])
-        svc.spreadsheets.return_value.values.return_value.append.assert_not_called()
+        ss.values.return_value.get.return_value.execute.side_effect = lambda: {"values": tab_rows.pop(0)}
+        return svc, ss
 
     def test_parse_checklist(self):
         got = decide.parse_checklist(
@@ -197,23 +162,60 @@ class DecideTests(unittest.TestCase):
             "- [ ] reach  out to entegee\nplain line\n- [ ] See https://a.b/c")
         self.assertEqual(got, ["Whole armor of God", "Reach out to Entegee", "See https://a.b/c"])
 
-    def test_notes_ingest_adds_only_new_unchecked_and_extracts_link(self):
-        from unittest.mock import MagicMock
-        svc = MagicMock()
-        ss = svc.spreadsheets.return_value
-        ss.get.return_value.execute.return_value = {"sheets": [{"properties": {"title": "Notes Inbox"}}]}
-        known = decide._note_key("Reach out to Entegee")
-        ss.values.return_value.get.return_value.execute.return_value = {"values": [
-            decide.NOTES_HEADER,
-            ["n-0004", "Apple Notes", "Reach out to Entegee"] + [""] * 8 + [known]]}
-        text = "- [ ] Reach out to Entegee\n- [x] Old\n- [ ] Read https://x.org/p now"
+    def test_ingest_goes_to_captured_without_duplicates(self):
+        header = ["id", "timestamp", "raw_text", "source_type", "urgency"]
+        svc, ss = self._svc([[header, ["c-0002", "t", "Reach out to Entegee"]]])
+        text = "- [ ] Reach out to  entegee\n- [x] Old\n- [ ] Do taxes\n- [ ] Pallet idea"
         with patch.object(decide, "_sheets_service", return_value=svc):
             r = self.client.post("/d/secret/api/notes", json={"text": text})
-            r2 = self.client.post("/d/wrong/api/notes", json={"text": text})
-        self.assertEqual(r.json(), {"unchecked_in_note": 2, "added": 1, "already_known": 1})
-        self.assertEqual(r2.status_code, 404)
+        self.assertEqual(r.json(), {"unchecked_in_note": 3, "added": 2, "already_known": 1})
+        rows = ss.values.return_value.append.call_args.kwargs["body"]["values"]
+        self.assertEqual([(a[0], a[2], a[3]) for a in rows],
+                         [("c-0003", "Do taxes", "apple-notes"), ("c-0004", "Pallet idea", "apple-notes")])
+        self.assertEqual(ss.values.return_value.append.call_args.kwargs["range"], "'Captured'!A:Z")
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            self.assertEqual(self.client.post("/d/wrong/api/notes", json={"text": text}).status_code, 404)
+
+    def test_approved_proposal_is_applied_to_next_tab(self):
+        header = ["id", "title", "outcome", "next_action", "readiness", "source", "moved_from", "timestamp"]
+        svc, ss = self._svc([[header, ["c-0001", "x"]]])
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            res = decide.apply_answers([{"tab": "Task Queue", "row": 6, "path": "t-5",
+                                         "approve": "Y", "handler": "Me"}])
+        self.assertEqual(res[0]["status"], "ok")
         row = ss.values.return_value.append.call_args.kwargs["body"]["values"][0]
-        self.assertEqual((row[0], row[2], row[8]), ("n-0005", "Read https://x.org/p now", "https://x.org/p"))
+        self.assertEqual(row[:7], ["c-0003", "Reach out to Entegee", "Intro call booked",
+                                   "Email recruiter", "ready", "apple-notes", "c-0003"])
+        self.assertTrue(row[7])  # timestamp filled
+        self.assertEqual(ss.values.return_value.append.call_args.kwargs["range"], "'Clarified'!A:Z")
+        stamp = self.fake.writes[-1]
+        self.assertEqual(stamp["range"], "'Task Queue'!K6")  # Applied UTC stamped
+
+    def test_rejected_or_duplicate_proposals_change_nothing(self):
+        header = ["id", "title"]
+        svc, ss = self._svc([[header, ["c-0003", "already"]]])
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            decide.apply_answers([{"tab": "Task Queue", "row": 6, "path": "t-5",
+                                   "approve": "N", "handler": "n/a"}])
+        ss.values.return_value.append.assert_not_called()
+        self.fake.writes.clear()
+        svc, ss = self._svc([[header, ["c-0003", "already"]]])
+        self.fake.tabs["Task Queue"][5][6:8] = ["", ""]
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            decide.apply_answers([{"tab": "Task Queue", "row": 6, "path": "t-5",
+                                   "approve": "Y", "handler": "Me"}])
+        ss.values.return_value.append.assert_not_called()  # id already there
+
+    def test_apply_action_rejects_bad_operations(self):
+        from unittest.mock import MagicMock
+        svc = MagicMock()
+        with patch.object(decide, "_sheets_service", return_value=svc):
+            for bad in ['{"op":"delete","to":"Clarified","id":"c-1","row":{}}',
+                        '{"op":"promote","to":"Captured","id":"c-1","row":{}}',
+                        '{"op":"promote","to":"Sheet1","id":"c-1","row":{}}',
+                        'not json', '{"op":"promote","to":"Clarified","id":"","row":{}}']:
+                self.assertEqual(decide.apply_action(bad, "Me"), "invalid")
+        svc.spreadsheets.assert_not_called()
 
     def test_batch_includes_sheet_link(self):
         url = decide.get_batch()["sheet_url"]
@@ -258,7 +260,7 @@ class DecideTests(unittest.TestCase):
     def test_missing_queue_tab_does_not_break_cleanup(self):
         del self.fake.tabs["Task Queue"]
         d = decide.get_batch(50)
-        self.assertEqual(d["pending_total"], 7)
+        self.assertEqual(d["pending_total"], 5)
 
     def test_task_answer_writes_queue_columns(self):
         res = decide.apply_answers([{"tab": "Task Queue", "row": 2, "path": "t-1",
@@ -314,7 +316,7 @@ class DecideTests(unittest.TestCase):
         page = self.client.get("/d/secret")
         self.assertEqual(page.status_code, 200)
         self.assertEqual(page.headers["cache-control"], "no-store")
-        self.assertEqual(self.client.get("/d/secret/api/batch").json()["pending_total"], 10)
+        self.assertEqual(self.client.get("/d/secret/api/batch").json()["pending_total"], 9)
         ok = self.client.post("/d/secret/api/answer", json={"answers": [
             {"tab": "Organize Proposal", "row": 2, "path": "Downloads/a.jpg", "approve": "Y", "handler": "Coach"}]})
         self.assertEqual(ok.json()["results"][0]["status"], "ok")
