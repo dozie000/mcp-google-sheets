@@ -771,7 +771,8 @@ async def _notes(request: Request):
         res = await asyncio.to_thread(ingest_notes, text)
     except Exception as e:
         logger.exception("decide: notes ingest failed")
-        return JSONResponse({"error": _explain(e)}, status_code=502, headers=_NO_CACHE)
+        return JSONResponse({"error": _explain(e), "detail": f"{type(e).__name__}: {str(e)[:300]}"},
+                            status_code=502, headers=_NO_CACHE)
     return JSONResponse(res, headers=_NO_CACHE)
 
 
