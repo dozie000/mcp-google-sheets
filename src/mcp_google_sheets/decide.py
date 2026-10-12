@@ -471,14 +471,22 @@ NOTES_SOURCE = "apple-notes"
 _CHECK_RE = re.compile(r"^\s*(?:[-*+]\s*)?\[( |x|X)\]\s?(.*)$")
 
 
+_MARK_RE = re.compile(r"(?:^|(?<=\s))(?:[-*+\u2022]\s*)?(?:\[( |x|X)\]|(\u2610|\u25cb|\u25ef)|(\u2611|\u2705|\u2714))[ \t]?", re.M)
+
+
 def parse_checklist(text: str) -> List[str]:
-    """Unchecked items from a markdown-style checklist, in order, de-duplicated."""
+    """Unchecked items from a checklist, in order, de-duplicated. Tolerates
+    markdown boxes (- [ ] / [x]), box glyphs, and items run together on one line."""
+    text = text.replace("\r", "\n").replace("\u00a0", " ")
+    marks = list(_MARK_RE.finditer(text))
     seen, out = set(), []
-    for line in text.splitlines():
-        m = _CHECK_RE.match(line)
-        if not m or m.group(1) != " ":
+    for i, m in enumerate(marks):
+        unchecked = m.group(1) == " " or m.group(2) is not None
+        if not unchecked:
             continue
-        item = " ".join(m.group(2).split())
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        seg = text[m.end():end].split("\n")[0]
+        item = " ".join(seg.split())
         if item and item.lower() not in seen:
             seen.add(item.lower())
             out.append(item)
@@ -561,7 +569,8 @@ def ingest_notes(text: str) -> Dict[str, Any]:
                 valueInputOption="RAW", insertDataOption="INSERT_ROWS",
                 body={"values": new_rows}).execute()
     return {"unchecked_in_note": len(items), "added": len(new_rows),
-            "already_known": len(items) - len(new_rows)}
+            "already_known": len(items) - len(new_rows),
+            "received_chars": len(text), "preview": text[:80]}
 
 
 def apply_action(action_text: str, handler: str) -> str:

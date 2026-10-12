@@ -168,7 +168,8 @@ class DecideTests(unittest.TestCase):
         text = "- [ ] Reach out to  entegee\n- [x] Old\n- [ ] Do taxes\n- [ ] Pallet idea"
         with patch.object(decide, "_sheets_service", return_value=svc):
             r = self.client.post("/d/secret/api/notes", json={"text": text})
-        self.assertEqual(r.json(), {"unchecked_in_note": 3, "added": 2, "already_known": 1})
+        j = r.json()
+        self.assertEqual((j["unchecked_in_note"], j["added"], j["already_known"]), (3, 2, 1))
         rows = ss.values.return_value.append.call_args.kwargs["body"]["values"]
         self.assertEqual([(a[0], a[2], a[3]) for a in rows],
                          [("c-0003", "Do taxes", "apple-notes"), ("c-0004", "Pallet idea", "apple-notes")])
@@ -377,3 +378,12 @@ def test_eastern_without_tzdb():
     assert _eastern(dt.datetime(2026, 12, 1, 12, 0, tzinfo=u)).hour == 7
     assert _eastern(dt.datetime(2026, 3, 8, 6, 59, tzinfo=u)).hour == 1
     assert _eastern(dt.datetime(2026, 3, 8, 7, 0, tzinfo=u)).hour == 3
+
+
+def test_parse_checklist_tolerant():
+    from mcp_google_sheets.decide import parse_checklist
+    assert parse_checklist("- [ ] a\n- [x] b\n- [ ] c") == ["a", "c"]
+    assert parse_checklist("- [ ] Whole armor - [ ] Recipes - [x] done") == ["Whole armor", "Recipes"]
+    assert parse_checklist("☐ one\r\n☑ two\r\n○ three") == ["one", "three"]
+    assert parse_checklist("Heading\n[ ]x\n") == ["x"]
+    assert parse_checklist("no boxes here") == []
